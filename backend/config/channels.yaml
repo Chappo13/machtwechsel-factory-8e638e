@@ -1,0 +1,172 @@
+# Channel profiles — each channel has its own niche, voice, style, history
+# Voice is set once and never changes for the channel
+
+channels:
+  de:
+    name: "Nina"
+    niche: "curiosity_history"
+    youtube_channel_id: "UCVZZnW0SO_AAWqQCfTbgRPg"  # немецкий curiosity-канал Nina
+    niche_keywords:
+      - "neugierige Geschichte"
+      - "menschliche Psychologie"
+      - "menschliche Natur"
+      - "frühe Menschen"
+      - "Zivilisation"
+      - "neugierige Wissenschaft"
+    voice_id: "Fghah4fztZORbiKfIGAs"  # ElevenLabs — выбран клиентом
+    style: "documentary"
+    visual_mode: "stick_figure"
+    music_mood: "calm"
+    duration_minutes: 20
+    description: "Nina — ich erkläre die neugierigen Fragen über die frühen Menschen, den Verstand und die menschliche Natur, damit du dein eigenes Leben aus einer anderen Perspektive siehst."
+    history_window: 15
+    script_style:
+      tone: "calm, warm, reflective first-person essayist — a smart friend sharing a discovery"
+      structure: "present-moment mirror hook → debunk assumption → 3 evidence beats (one real verifiable fact each, never fabricated) → big idea → loop back to now"
+      narration: "first person 'ich' + second person 'du'/'wir' — pull the listener into their own life"
+      forbidden_phrases:
+        - "Hallo Leute"
+        - "Willkommen zurück"
+        - "Vergiss nicht zu abonnieren"
+        - "In diesem Video"
+        - "Du wirst es nicht glauben"
+    search_queries:
+      - "wie lebten die frühen Menschen"
+      - "Geschichte der Menschheit Dokumentation"
+      - "Psychologie des menschlichen Verhaltens"
+      - "menschliche Natur Wissenschaft"
+      - "antike Zivilisationen Entdeckungen"
+      - "warum entwickelten sich Menschen"
+      - "Kuriositäten der alten Geschichte"
+      - "was machten prähistorische Menschen"
+
+  es:
+    name: "El Porqué"
+    niche: "curiosity_history"
+    youtube_channel_id: "UCC8-zlQXtkoNVlL6AoOaDQw"  # новый чистый канал El Porqué (старый es в шэдоу-лимите)
+    niche_keywords:
+      - "historia curiosa"
+      - "psicología humana"
+      - "naturaleza humana"
+      - "civilización"
+      - "pueblos antiguos"
+      - "ciencia curiosa"
+    voice_id: "3mmJ2Z5SLZ9OkeZZcv5p"  # ElevenLabs — выбран клиентом
+    style: "documentary"
+    visual_mode: "stick_figure"  # цельно-мультяшный канал → планировщик форсит doodle (Seedream v4)
+    music_mood: "calm"  # спокойные/рефлексивные треки (как vi)
+    duration_minutes: 20  # как у референса (Mack 1M ~20 мин): больше mid-roll вставок = больше дохода; ~18000 симв
+    description: "El Porqué — explico las preguntas curiosas sobre los humanos antiguos, la mente y la naturaleza humana, para que veas tu propia vida desde otra perspectiva."
+    history_window: 15
+    script_style:
+      tone: "calm, warm, reflective first-person essayist — a smart friend sharing a discovery"
+      structure: "present-moment mirror hook → debunk assumption → 3 evidence beats (one real verifiable fact each, never fabricated) → big idea → loop back to now"
+      narration: "first person 'yo' + second person 'tú'/'nosotros' — pull the listener into their own life"
+      forbidden_phrases:
+        - "Hola amigos"
+        - "Bienvenidos de vuelta"
+        - "No olvides suscribirte"
+        - "En este video"
+        - "No vas a creer"
+    search_queries:
+      - "cómo vivían los pueblos antiguos"
+      - "historia de la humanidad documental"
+      - "psicología del comportamiento humano"
+      - "naturaleza humana ciencia"
+      - "civilizaciones antiguas descubrimientos"
+      - "por qué los humanos evolucionaron"
+      - "curiosidades de la historia antigua"
+      - "qué hacían los humanos prehistóricos"
+
+  fr:
+    name: "Homo Raconte"
+    niche: "curiosity_history"
+    youtube_channel_id: ""  # @Homo_Raconte — добавить UC-id для дедупа
+    niche_keywords:
+      - "histoire curieuse"
+      - "psychologie humaine"
+      - "nature humaine"
+      - "premiers humains"
+      - "civilisation"
+      - "science curieuse"
+    voice_id: "nr2EGJNe96rzn9FRlTId"  # ElevenLabs — выбран клиентом
+    style: "documentary"
+    visual_mode: "stick_figure"
+    music_mood: "calm"
+    duration_minutes: 20
+    description: "Homo Raconte — j'explore les questions curieuses sur les premiers humains, l'esprit et la nature humaine, pour que tu voies ta propre vie sous un autre angle."
+    history_window: 15
+    script_style:
+      tone: "calm, warm, reflective first-person essayist — a smart friend sharing a discovery"
+      structure: "present-moment mirror hook → debunk assumption → 3 evidence beats (one real verifiable fact each, never fabricated) → big idea → loop back to now"
+      narration: "first person 'je' + second person 'tu'/'nous' — pull the listener into their own life"
+      forbidden_phrases:
+        - "Salut tout le monde"
+        - "Bienvenue"
+        - "N'oublie pas de t'abonner"
+        - "Dans cette vidéo"
+        - "Tu ne vas pas le croire"
+    search_queries:
+      - "comment vivaient les premiers humains"
+      - "histoire de l'humanité documentaire"
+      - "psychologie du comportement humain"
+      - "nature humaine science"
+      - "civilisations anciennes découvertes"
+      - "pourquoi les humains ont évolué"
+      - "curiosités de l'histoire ancienne"
+      - "que faisaient les humains préhistoriques"
+
+  en:
+    name: "Cave to Couch"
+    niche: "curiosity_history"
+    youtube_channel_id: ""  # @Cave_to_Couch — добавить UC-id для дедупа
+    niche_keywords:
+      - "curious history"
+      - "human psychology"
+      - "human nature"
+      - "early humans"
+      - "civilization"
+      - "curious science"
+    voice_id: "1SM7GgM6IMuvQlz2BwM3"  # ElevenLabs — выбран клиентом
+    style: "documentary"
+    visual_mode: "stick_figure"
+    music_mood: "calm"
+    duration_minutes: 20
+    description: "Cave to Couch — I explain the curious questions about early humans, the mind and human nature, so you see your own life from another perspective."
+    history_window: 15
+    script_style:
+      tone: "calm, warm, reflective first-person essayist — a smart friend sharing a discovery"
+      structure: "present-moment mirror hook → debunk assumption → 3 evidence beats (one real verifiable fact each, never fabricated) → big idea → loop back to now"
+      narration: "first person 'I' + second person 'you'/'we' — pull the listener into their own life"
+      forbidden_phrases:
+        - "Hey guys"
+        - "Welcome back"
+        - "Don't forget to subscribe"
+        - "In this video"
+        - "You won't believe"
+    search_queries:
+      - "how did early humans live"
+      - "history of humanity documentary"
+      - "psychology of human behavior"
+      - "human nature science"
+      - "ancient civilizations discoveries"
+      - "why did humans evolve"
+      - "curiosities of ancient history"
+      - "what did prehistoric humans do"
+
+# Music library — manually curated tracks with individual volume
+# Each track is tested by ear before adding
+music_library:
+  # Tracks will be added here after manual selection
+  # Format:
+  # - id: unique-id
+  #   name: "Track Name"
+  #   path: "data/music/filename.mp3"
+  #   mood: epic|calm|tense|inspiring|ambient
+  #   volume: 0.0-1.0 (individual per track)
+  #   bpm: 120
+  #   duration_sec: 180
+  tracks: []
+
+# Auto-upload is DISABLED — videos are uploaded manually
+auto_upload: false

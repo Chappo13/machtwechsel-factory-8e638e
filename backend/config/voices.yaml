@@ -1,0 +1,69 @@
+# Voice configuration per language
+# Voicer API (ElevenLabs unlimited, $50/mo)
+
+voices:
+  de:
+    voice_id: "Fghah4fztZORbiKfIGAs"
+    edge_voice: "de-DE-KatjaNeural"  # Edge TTS fallback
+    name: "German Documentary"
+    model: "eleven_v3"
+    settings:
+      stability: 0.55
+      similarity_boost: 0.80
+      style: 0.15
+      speed: 0.90
+    chars_per_minute: 850
+    chunk_size: 5000
+    pause_between_chunks: 0.4
+
+  es:
+    voice_id: "3mmJ2Z5SLZ9OkeZZcv5p"  # ElevenLabs — выбран клиентом (заменил «снотворного» Mac)
+    edge_voice: "es-MX-JorgeNeural"  # Edge TTS fallback (если fal/Voicer недоступны)
+    name: "Spanish Curiosity Essayist"
+    model: "eleven_v3"
+    settings:
+      stability: 0.50
+      similarity_boost: 0.80
+      style: 0.20
+      speed: 0.95
+    chars_per_minute: 900
+    chunk_size: 5000
+    pause_between_chunks: 0.4
+
+  en:
+    voice_id: "1SM7GgM6IMuvQlz2BwM3"  # выбран клиентом (заменил TmNe0…)
+    edge_voice: "en-US-AriaNeural"  # Edge TTS fallback
+    name: "English Curiosity Essayist"
+    model: "eleven_v3"
+    settings:
+      stability: 0.50
+      similarity_boost: 0.80
+      style: 0.15
+      speed: 0.95
+    chars_per_minute: 900
+    chunk_size: 5000
+    pause_between_chunks: 0.4
+
+  fr:
+    voice_id: "nr2EGJNe96rzn9FRlTId"  # выбран клиентом
+    edge_voice: "fr-FR-HenriNeural"  # Edge TTS fallback
+    name: "French Curiosity Essayist"
+    model: "eleven_v3"
+    settings:
+      stability: 0.50
+      similarity_boost: 0.80
+      style: 0.20
+      speed: 0.95
+    chars_per_minute: 900
+    chunk_size: 5000
+    pause_between_chunks: 0.4
+
+# TTS API
+api:
+  endpoint: "https://voicer.mat3u.com/api/v1/voice/synthesize"
+  status_endpoint: "https://voicer.mat3u.com/api/v1/voice/status/{task_id}"
+  download_endpoint: "https://voicer.mat3u.com/api/v1/voice/download/{task_id}"
+  poll_interval: 2
+  max_polls: 240
+  auth_header: "Authorization"
+  auth_prefix: "Bearer"

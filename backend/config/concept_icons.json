@@ -1,0 +1,21 @@
+{
+  "_comment": "Реестр код-иконок для ConceptCard (Remotion). id синхронизирован с remotion/src/icons/index.ts. keywords (DE/EN) — для подбора иконки под абстрактную сцену валидатором/промптом. Если концепт не матчится ни на одну иконку → сцена уходит в сток (не показываем точку-с-подписью).",
+  "icons": {
+    "money":    ["geld", "kapital", "vermögen", "euro", "summe", "money", "cash", "wealth", "funds"],
+    "growth":   ["wachstum", "aufstieg", "anstieg", "boom", "rendite", "gewinn", "growth", "rise", "profit"],
+    "crash":    ["absturz", "crash", "kollaps", "pleite", "verlust", "zusammenbruch", "fall", "collapse", "loss", "bankrott"],
+    "person":   ["person", "mann", "frau", "gründer", "chef", "anleger", "opfer", "individual", "founder", "victim"],
+    "company":  ["firma", "unternehmen", "konzern", "bank", "zentrale", "büro", "company", "corporation", "headquarters"],
+    "document": ["vertrag", "dokument", "bilanz", "akte", "bericht", "papier", "contract", "document", "report", "balance"],
+    "warning":  ["warnung", "gefahr", "risiko", "alarm", "skandal", "warning", "danger", "risk", "scandal"],
+    "justice":  ["gerechtigkeit", "urteil", "gericht", "rechenschaft", "strafe", "prozess", "justice", "court", "verdict", "law"],
+    "time":     ["zeit", "jahre", "frist", "dauer", "verzögerung", "time", "years", "deadline", "delay"],
+    "lock":     ["sicherheit", "geheim", "verschluss", "schutz", "vertraulich", "security", "secret", "locked", "protection"],
+    "network":  ["netzwerk", "verbindung", "geflecht", "struktur", "kontakte", "network", "connection", "web", "structure"],
+    "globe":    ["international", "global", "ausland", "welt", "offshore", "international", "global", "world", "abroad"],
+    "mask":     ["lüge", "betrug", "fassade", "täuschung", "tarnung", "schein", "lie", "fraud", "facade", "deception"],
+    "search":   ["ermittlung", "untersuchung", "aufdeckung", "recherche", "spur", "investigation", "search", "probe"],
+    "question": ["frage", "rätsel", "geheimnis", "unklar", "mystery", "question", "unknown", "puzzle"],
+    "chain":    ["verbindung", "kette", "abhängigkeit", "verflechtung", "link", "chain", "dependency"]
+  }
+}

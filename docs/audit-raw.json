@@ -1,0 +1,1252 @@
+{
+ "findings": [
+  {
+   "title": "improve_script конфликтует сам с собой: скоринг до правки, но не после — последняя итерация может ухудшить качество и это не ловится",
+   "severity": "MAJOR",
+   "detail": "В цикле improve_script (script.py:119-153) на каждой итерации сначала вызывается _score_script(current), и если score >= 85 цикл прерывается. Но скоринг считается ДО правки этой итерации, а не после. То есть: итерация N делает LLM-правку → результат записывается в current → цикл идёт на N+1, считает score нового текста → если он стал ХУЖЕ 85, делается ещё одна правка поверх. Последняя выполненная LLM-правка (на max_iterations) НИКОГДА не проверяется скорингом — её результат возвращается как есть. Если Gemini на финальной итерации укоротил/испортил текст (а improve-промпт iteration 1 требует 'каждое предложение <25 слов' и удаление фраз — это сокращает объём), это уходит дальше в пайплайн без проверки. Нет сравнения score_before/score_after и нет отката к лучшей версии. Фактически система не гарантирует, что improved лучше исходного.",
+   "recommendation": "Хранить best_version по максимальному score. После КАЖДОЙ LLM-правки пересчитывать score, и если он упал ниже предыдущего — откатываться к предыдущей версии (keep-best). Возвращать версию с лучшим score, а не последнюю выполненную. Логировать score до/после каждой итерации.",
+   "files": [
+    "backend/pipeline/script.py:119",
+    "backend/pipeline/script.py:139",
+    "backend/pipeline/script.py:154"
+   ]
+  },
+  {
+   "title": "Length enforcement ломается из-за max_tokens=32000 при цели 19-22k символов — DeepSeek упирается в лимит и обрезается на полуслове",
+   "severity": "MAJOR",
+   "detail": "target_chars для DE 22 мин = 22*910 = 20020 символов. Немецкий текст это ~5500-7000 токенов вывода, плюс continuation-логика. max_tokens=32000 (models.yaml:11) формально достаточно, НО deepseek-chat-v3-0324 на OpenRouter часто завершает генерацию по finish_reason='length' или 'stop' преждевременно на длинных креативных задачах. call_llm (llm.py:71) НЕ проверяет finish_reason — берёт content как есть, даже если он обрезан на полуслове. Затем generate_script (script.py:78-99) при коротком тексте делает continuation, но склейка script.rstrip() + continuation.lstrip() даёт шов посреди предложения (обрыв → новое начало), что ломает связность и retention. Continuation-промпт ещё и захардкожен на НЕМЕЦКОМ (script.py:87-92) для ВСЕХ языков — для ES/EN скрипта добавляется немецкая инструкция, модель может ответить по-немецки или сбиться.",
+   "recommendation": "1) В call_llm возвращать/логировать finish_reason; если 'length' — это сигнал обрезки. 2) Continuation-промпт сделать языкозависимым (de/es/en), как сделано в _build_improvement_prompt. 3) При склейке отрезать оборванное последнее предложение основного текста до последней точки/!/? перед добавлением continuation, чтобы не было шва посреди фразы.",
+   "files": [
+    "backend/pipeline/script.py:68",
+    "backend/pipeline/script.py:87",
+    "backend/pipeline/script.py:99",
+    "backend/utils/llm.py:71",
+    "backend/config/models.yaml:11"
+   ]
+  },
+  {
+   "title": "_score_script не учитывает RU-метки источников и наказывает корректные тексты — скоринг плохо коррелирует с retention",
+   "severity": "MAJOR",
+   "detail": "_score_script (script.py:170-221) — грубый прокси-скоринг по регуляркам, и он не покрывает то, на что нацелены '9+/10'-правила промпта. Проблемы: (1) source_patterns (script.py:191) ищет 'laut/según/according to/quelle/...' но _build_source_context (script.py:322) вставляет заголовки источников на РУССКОМ ('### Источник N') — это влияет на промпт, но в самом сценарии русских меток нет, ок; однако скоринг не проверяет НИ ОДНУ из ключевых retention-вещей: нет проверки re-hook на 40-50%, нет проверки curiosity gap, нет проверки повторов риторических паттернов (анти-AI правило #2 из промпта). (2) Скоринг проверяет первую строку на наличие цифры (script.py:217-219), но хороший хук по промпту = 3 предложения, цифра может быть во 2-3-м. (3) forbidden patterns матчатся case-insensitive подстрокой (script.py:179) но НЕ учитывают allowed-паттерны с max_occurrences из patterns.yaml — overuse хуков (главный AI-tell) вообще не штрафуется, хотя hook_overuse_penalty задан в конфиге (patterns.yaml:96). Итог: скоринг может выдать 85+ тексту с повторяющимися паттернами и без re-hook, и improve остановится рано.",
+   "recommendation": "Добавить в _score_script: подсчёт повторов allowed-паттернов с штрафом за превышение max_occurrences (использовать hook_overuse_penalty из конфига); проверку наличия re-hook-маркеров во второй трети текста; детекцию повторяющихся n-грамм/зачинов предложений (анти-AI-повтор). Минимум — задействовать уже описанный в patterns.yaml hook_overuse_penalty, сейчас он не читается нигде.",
+   "files": [
+    "backend/pipeline/script.py:170",
+    "backend/pipeline/script.py:179",
+    "backend/pipeline/script.py:191",
+    "backend/pipeline/script.py:217",
+    "backend/config/patterns.yaml:96"
+   ]
+  },
+  {
+   "title": "virality_filter перетирает результат improve_script и НЕ скорится — может вернуть текст с потерянным хуком/обрезкой",
+   "severity": "MAJOR",
+   "detail": "Пайплайн: improve → virality (orchestrator.py:176-199). apply_virality_filter (virality.py:17-57) делает ещё один полный LLM-проход (Gemini, temp 0.35, max_tokens=16000 — это ПОЛОВИНА от 32000, которыми генерился скрипт). Для 20k-символьного DE-скрипта 16000 output-токенов может не хватить → текст обрежется, и _extract_script (virality.py:159-184) этого не ловит. Результат virality НЕ проверяется скорингом и БЕЗУСЛОВНО перезаписывает improved_script_path (orchestrator.py:199) — даже если virality-проход ухудшил/укоротил текст, дальше в TTS уходит именно он. Плюс _extract_script (virality.py:166-172) ищет маркер '---' и режет ВСЁ до него: если модель вернула чистый скрипт без маркеров, но где-то в середине есть '---' (тире-разделитель), скрипт обрежется с начала. Логика поиска script_start берёт ПЕРВЫЙ '---' — опасно.",
+   "recommendation": "1) Поднять virality max_tokens до 32000 (models.yaml:25). 2) После virality пересчитать score и сравнить с improved-версией — если virality дал меньший score ИЛИ длина упала >10%, оставить improved (не перезаписывать). 3) _extract_script: убрать '---'/'===' из маркеров начала (искать только явные 'revised script'/'überarbeitetes skript'); проверять, что результат не короче 70% входа, иначе вернуть исходный response целиком.",
+   "files": [
+    "backend/pipeline/virality.py:48",
+    "backend/pipeline/virality.py:166",
+    "backend/pipeline/orchestrator.py:199",
+    "backend/config/models.yaml:25"
+   ]
+  },
+  {
+   "title": "Конфликт инструкций по хуку: промпт требует 15с, virality-фильтр требует 30с — re-hook и хук размываются",
+   "severity": "MINOR",
+   "detail": "script-de.md:11-40 жёстко настраивает на хук 0:00-0:15 ('KEINE 30 Sekunden, NUR 15') с трёхчастной структурой (цифра/identity-threat/curiosity gap). Но virality.py:65 (DE) и все остальные prompt-билдеры virality оценивают 'Hook (erste 30 Sekunden)' и при <8 ПЕРЕПИСЫВАЮТ его. То есть последний проход переписывает хук под 30-секундную логику, размывая выверенную 15-секундную структуру из script-de.md. Также improve-промпт iteration 1 (script.py:256) проверяет re-hook на 50%, а virality (virality.py:70-74) переписывает '3 самых слабых места' — два прохода независимо втыкают curiosity loops в одни и те же зоны, что даёт переизбыток '...aber das war noch nicht alles' (ровно тот AI-повтор, который правило #2 промпта запрещает).",
+   "recommendation": "Согласовать тайминг хука: либо везде 15с (привести virality к 'erste 15 Sekunden'), либо явно разделить роли — improve отвечает за тело/re-hook, virality ТОЛЬКО за хук и pattern interrupts, не трогая то что уже сделал improve. Добавить в virality-промпт запрет на дублирование уже существующих curiosity-фраз и лимит на повтор '...but that wasn't all' (max 2-3).",
+   "files": [
+    "backend/prompts/script-de.md:31",
+    "backend/pipeline/virality.py:65",
+    "backend/pipeline/script.py:256"
+   ]
+  },
+  {
+   "title": "Дубликат строки в script-es.md ослабляет промпт",
+   "severity": "MINOR",
+   "detail": "В script-es.md строки 37 и 38 идентичны: '⚠️ CRÍTICO: La marca del 50%...re-gancho más fuerte del video.' повторена дважды подряд. Это не критично функционально, но (1) занимает токены, (2) для модели повтор инструкции выглядит как шум и может снизить вес остальных пунктов блока 'PUNTO DE QUIEBRE'. В DE/EN версиях дубликата нет — значит это опечатка при копировании.",
+   "recommendation": "Удалить дублирующую строку script-es.md:38.",
+   "files": [
+    "backend/prompts/script-es.md:37",
+    "backend/prompts/script-es.md:38"
+   ]
+  },
+  {
+   "title": "Data-integrity правило есть в промпте, но никак не верифицируется — прогнозы могут уходить в публикацию",
+   "severity": "MAJOR",
+   "detail": "Правило #1 'DATEN-INTEGRITÄT' (script-de.md:126, аналоги в en/es) запрещает выдавать прогнозы за факты и будущие даты за свершившиеся события — критично для доверия к каналу. Но это ТОЛЬКО инструкция в промпте; ни improve_script, ни _score_script, ни virality_filter, ни отдельная fact_check-фаза (она есть в models.yaml:27 но НЕ вызывается в orchestrator.py — в pipeline.phases её нет, orchestrator.py:118-130) не проверяют выполнение. DeepSeek/Gemini охотно галлюцинируют конкретные цифры с фейковыми источниками ('Laut Bloomberg verlor X 47 Mio'), а скоринг за наличие 'bloomberg/reuters' в тексте даже ДОБАВЛЯЕТ баллы (script.py:191-195) — то есть система поощряет выдуманные ссылки на источники. Сегодня 2026-06-08, темы про 2025 события: высокий риск что модель подаст прогноз за факт.",
+   "recommendation": "Активировать fact_check как отдельную фазу в orchestrator между virality и TTS (модель уже сконфигурирована, temp 0.2): просить модель пометить/смягчить все недатированные числа и непроверяемые ссылки на источники ('по оценкам', 'предположительно'). Минимум — убрать из _score_script бонус за простое упоминание Bloomberg/Reuters без даты рядом, чтобы не поощрять фейковые ссылки.",
+   "files": [
+    "backend/prompts/script-de.md:126",
+    "backend/pipeline/orchestrator.py:118",
+    "backend/config/models.yaml:27",
+    "backend/pipeline/script.py:191"
+   ]
+  },
+  {
+   "title": "Мёртвый код в improve_script (length guard ничего не делает) — заявленная защита длины отсутствует",
+   "severity": "MINOR",
+   "detail": "script.py:150-152: блок 'Length guard: warn if script drifts >15%' состоит из 'if hasattr(generate_script, __wrapped__): pass'. Это no-op заглушка: проверки дрейфа длины НЕТ. Комментарий обещает защиту от усыхания текста при улучшении, но её нет. Это важно для retention: improve iteration 1 агрессивно режет ('каждое предложение <25 слов', удаление фраз), что реально сокращает длину → итоговое видео короче целевых 20-25 мин → меньше watch-time. Сейчас сокращение происходит молча.",
+   "recommendation": "Реализовать реальную проверку: после каждой итерации сравнивать len(current) с длиной до улучшения; если упало >15% — логировать warning и/или просить модель восстановить объём (как в continuation-логике generate_script). Либо удалить мёртвую заглушку, если защита не нужна.",
+   "files": [
+    "backend/pipeline/script.py:150"
+   ]
+  },
+  {
+   "title": "Скоринг и continuation используют захардкоженные пороги длины, не связанные с target_chars — рассинхрон с реальной целью",
+   "severity": "MINOR",
+   "detail": "_score_script (script.py:183-188) оперирует абсолютными порогами 10000/14000/25000/30000 символов независимо от lang и duration_minutes. Но реальная цель зависит от длины: для 25 мин DE target = 25*910 = 22750, верхний 'good range' 25000 почти впритык, а для 12-мин видео (если такое создадут) 14000+ недостижимо — скоринг будет всегда штрафовать. Скоринг не получает target_chars/duration, поэтому не может корректно оценить, попал ли текст в нужную длину. Это рассинхронизировано с min_characters/max_characters, которые передаются в генерацию (script.py:62-64).",
+   "recommendation": "Передавать target_chars (или duration_minutes) в _score_script и improve_script, считать длину относительно цели (например ±10% = бонус, <80% = штраф), вместо абсолютных констант. Так скоринг будет работать для любой длины и языка.",
+   "files": [
+    "backend/pipeline/script.py:183",
+    "backend/pipeline/script.py:62",
+    "backend/pipeline/script.py:105"
+   ]
+  },
+  {
+   "title": "Хук-структура DE сильнее EN/ES — гайд по первым 15с и кривой внимания есть только в немецком промпте",
+   "severity": "IMPROVEMENT",
+   "detail": "script-de.md содержит детальный блок 'KRITISCHE RETENTION-REGEL' с разбивкой кривой внимания (0:00-0:15/0:15-1:00/...), правилом 'не сберегать сильнейшие факты на потом', PRE-PAYOFF с re-hook, и явным примером хорошего хука (script-de.md:9-63). В script-en.md и script-es.md этого нет — там хук описан как 0:00-0:30 без покадровой кривой и без 'обратной сортировки силы фактов'. EN/ES каналы (ES — целевой по CLAUDE.md) получают заметно более слабый промпт по удержанию первых секунд. Это прямой проигрыш в retention для не-немецких каналов.",
+   "recommendation": "Портировать в script-en.md и script-es.md блок кривой внимания и правило '15с хук + не сберегать сильнейшие факты' из script-de.md (строки 9-63). Привести все три языка к одному уровню детализации хука и re-hook.",
+   "files": [
+    "backend/prompts/script-de.md:9",
+    "backend/prompts/script-en.md:18",
+    "backend/prompts/script-es.md:18"
+   ]
+  },
+  {
+   "title": "Generate→improve не передаёт source_transcripts дальше, фактовая база теряется при правке/virality",
+   "severity": "IMPROVEMENT",
+   "detail": "generate_script принимает source_transcripts и строит фактовый контекст (script.py:26,57). Но _phase_script в orchestrator вообще не передаёт транскрипты (orchestrator.py:167-171 — вызывает без source_transcripts, всегда None), так что фича по факту не активна в пайплайне. Даже если бы передавались — improve_script и virality_filter не видят источников и работают только с готовым текстом, поэтому при 'добавь больше фактов/источников' (improve iteration 0, script.py:233-238) модель вынуждена ВЫДУМЫВАТЬ цифры и ссылки, не имея фактовой базы. Это усиливает проблему data-integrity: improve буквально просит '6 источников', модель их галлюцинирует.",
+   "recommendation": "1) Прокинуть source_transcripts через VideoTask в _phase_script. 2) Передавать сжатый фактовый контекст (числа/даты/источники) и в improve_script iteration 0, чтобы 'усиление фактов' опиралось на реальные данные, а не на галлюцинации.",
+   "files": [
+    "backend/pipeline/orchestrator.py:167",
+    "backend/pipeline/script.py:26",
+    "backend/pipeline/script.py:233"
+   ]
+  },
+  {
+   "title": "v5 даёт intent-first отбор визуала: medium следует из описания сцены, а не из ключевых слов",
+   "severity": "MAJOR",
+   "detail": "На integrate plan_scenes генерит плоский план (queries 4-5 шт + mood) и всё (git show integrate:backend/pipeline/clips.py, plan_scenes ~stroka 47-95). На v5 промпт переписан на intent-first: LLM сначала пишет on_screen (одно конкретное англ. предложение что зритель буквально видит), потом выбирает medium из 7 вариантов (stock_video / image / infographic_counter / chart / split / title / map), и только для инфографики отдаёт remotion_data с реальными числами (v5:backend/pipeline/clips.py:54-130). Маппинг medium->visual_type и строгая валидация в _normalize_scene_types (clips.py:160-215): chart без >=2 точек деградирует в сток, accent чинится до hex, 1.48 'Mio' масштабируется в 1480000 через _fix_million_floats. Это устраняет корневую проблему старого стека — он либо искал сток по абстрактным словам, либо звал FLUX, который галлюцинировал 'графики' и фейковую архивку. Теперь historical/portrait/document/map уходят в реальное фото (Wikimedia/Pexels) с Ken Burns, а числа/тренды/сравнения — в детерминированную инфографику с настоящими цифрами из нарратива.",
+   "recommendation": "Это ядро ценности v5. При мердже в integrate переносить целиком вместе с visual_router.py, remotion_render.py, vision_scorer.py и align_scenes.py — частичный перенос (только промпт без валидации/роутера) сломается, downstream работает на visual_type, которого на integrate нет.",
+   "files": [
+    "backend/pipeline/clips.py:54",
+    "backend/pipeline/clips.py:139",
+    "backend/pipeline/clips.py:160",
+    "backend/pipeline/clips.py:221"
+   ]
+  },
+  {
+   "title": "6 типов Remotion-композиций заменяют FLUX для всех data-сцен (детерминированно, без галлюцинаций)",
+   "severity": "MAJOR",
+   "detail": "remotion/src: NumberCounter (один большой счётчик 0->N с bezier-easing), LineChart (SVG-линия тренда, рисуется через strokeDashoffset, точки с подписями), BarComparison (две растущие колонки A/B, числовое сравнение), SplitScreen (текстовое A-vs-B, два полуэкрана со слайдом), TitleCard (intro/outro/глава, fade-in+fade-out на всю длину), MapWithPins (упрощённый SVG-контур Германии с анимированными пинами). Все 1920x1080@30fps, единая тёмная палитра (#0A0E1A фон, #E63946 акцент), формат чисел de-DE. render_for_scene маппит visual_type->composition, причём infographic_split с числовым leftValue уходит в BarComparison, текстовый — в SplitScreen (remotion_render.py:62-85). Длина анимации тянется на всю сцену через calculateMetadata + props.durationSec (Root.tsx, calcDur), а не морозит последний кадр. Качественная дельта против FLUX: число/график всегда точные и читаемые, нет водяных знаков и кривого текста, согласованный брендинг. FLUX на v5 остаётся ТОЛЬКО last-resort для stock/image сцен — для data-сцен он отключён намеренно (clips.py:577-582 коммент 'hallucinated charts were the whole problem').",
+   "recommendation": "При интеграции на Railway проверить, что REMOTION_DIR=/app/remotion реально содержит node_modules: в Dockerfile stage 2 (remotion-bundle) делает npm install, но его node_modules НЕ копируется в runtime — runtime делает повторный npm install (Dockerfile stage 3). Stage 2 фактически мёртвый. Убрать дублирующий stage или копировать node_modules из него, иначе билд тратит время дважды.",
+   "files": [
+    "remotion/src/Root.tsx",
+    "remotion/src/compositions/NumberCounter.tsx",
+    "remotion/src/compositions/LineChart.tsx",
+    "remotion/src/compositions/MapWithPins.tsx",
+    "backend/pipeline/remotion_render.py:62"
+   ]
+  },
+  {
+   "title": "Vision-скоринг кадра (Gemini Flash) перед скачиванием — отбор стока по смыслу, а не по совпадению слов",
+   "severity": "MAJOR",
+   "detail": "На integrate MultiStockClient.search_and_download берёт первый подходящий по длительности клип, без проверки релевантности (git show integrate:backend/stock/multi.py). На v5 добавлен vision_scorer.py: score_thumbnail оценивает thumbnail ДО скачивания (дёшево), score_frame — центральный кадр ПОСЛЕ (точно), через Gemini Flash по тому же OpenRouter-ключу (~$0.05/видео). multi.py v5 получил scene_text-параметр и _rank_by_relevance — ранжирует кандидатов по соответствию кадра смыслу сцены (multi.py:28-76), деградирует к сортировке по качеству если vision недоступен. clips.py пробрасывает scene_text=on_screen в каждый search_and_download (clips.py download_clips, stock-ветка). Это напрямую бьёт по главной болячке faceless-видео — нерелевантный сток ('office' вместо нужной сцены), убивающий удержание.",
+   "recommendation": "Перенести vision_scorer.py + новую сигнатуру multi.py вместе. Учесть стоимость: при shot-splitting число поисков на видео вырастает в разы (каждый ~6с шот = отдельный поиск), а каждый поиск скорит несколько thumbnail — реальная стоимость vision может быть выше заявленных $0.05. Проверить VISION_SCORE_THRESHOLD=0.2 (очень низкий — почти ничего не отсекает) и таймаут 8с на вызов.",
+   "files": [
+    "backend/pipeline/vision_scorer.py:1",
+    "backend/stock/multi.py:28",
+    "backend/stock/multi.py:59"
+   ]
+  },
+  {
+   "title": "Shot-splitting: семантические сцены режутся на ~6с кадры с монтажом по паузам голоса",
+   "severity": "MAJOR",
+   "detail": "integrate отдаёт один клип на сцену (download_clips итерирует scene_plan напрямую) — длинная сцена = статичный 15-20с кадр, что выглядит дёшево и роняет удержание. v5 добавил split_scenes (clips.py:400-447): сток-сцена длиннее 10с режется на куски ~target, где target зависит от mood (dramatic/tense 5с, calm 7.5с — _MOOD_TARGET clips.py:343), каждый кусок получает повёрнутый список queries (другой кадр). Каты притягиваются к cut_points — естественным паузам голоса из align_scenes (_attach_cut_points в align_scenes.py:197, snap в clips.py:366). Инфографика держится свой cap (_INFOGRAPHIC_CAP: counter 6с, chart 9с, clips.py:351), остаток бита заполняется b-roll, чтобы число не висело статично 10с. _enforce_variety не даёт больше 2 data-инфографик подряд — лишние превращает в сток (clips.py:451). Это профессиональный монтажный темп вместо слайдшоу.",
+   "recommendation": "Перенести вместе с align_scenes.py (нужны cut_points из STT). Без align_scenes split_scenes деградирует к равномерному резу без привязки к голосу — работает, но каты не попадают в паузы. realign_scene_plan вызывается в orchestrator v5 строка 243 — проверить, что STT-выравнивание включено в integrate-пайплайне.",
+   "files": [
+    "backend/pipeline/clips.py:400",
+    "backend/pipeline/clips.py:451",
+    "backend/pipeline/align_scenes.py:197",
+    "backend/pipeline/clips.py:343"
+   ]
+  },
+  {
+   "title": "Реальные фото (Wikimedia/Wikipedia/Internet Archive) + burned text-overlay ключевых чисел",
+   "severity": "IMPROVEMENT",
+   "detail": "visual_router.py — единый роутер источников с приоритетом: Pexels video -> Pixabay video -> Pexels photo -> Wikipedia/Wikimedia (бесплатно, идеально для исторического/DDR/финансов) -> Internet Archive (Prelinger/NASA архивка) -> FLUX как last resort. _download_image (clips.py:262) для image-сцен качает реальное фото и применяет Ken Burns — это закрывает дыру, из-за которой раньше архивку/портреты галлюцинировал FLUX. Отдельно BURN_OVERLAYS (clips.py:300-360): _burn_overlay запекает lower-third с ключевым числом (text_overlay из плана, напр '295.000 Fortzüge') поверх b-roll/фото через ffmpeg drawtext — держит цифру на экране = доверие + удержание. Это бесплатные источники, снижающие зависимость от платного FLUX и стокового лимита.",
+   "recommendation": "URL Internet Archive строится эвристикой '{ident}.mp4' (visual_router.py search_archive_org, коммент '# heuristic') — часто 404, реальное имя файла другое. Низкий приоритет, но если archive-ветку включать — добавить запрос metadata API для реального имени файла, иначе эти кандидаты всегда падают.",
+   "files": [
+    "backend/visual_router.py:1",
+    "backend/pipeline/clips.py:262",
+    "backend/pipeline/clips.py:316"
+   ]
+  },
+  {
+   "title": "Remotion рендерится через 'npx --yes remotion render' (CLI на каждую сцену) — медленно, без переиспользования bundle",
+   "severity": "MINOR",
+   "detail": "remotion_render.render вызывает 'npx --yes remotion render <comp> ...' с cwd=REMOTION_DIR на КАЖДУЮ инфографик-сцену (remotion_render.py:38-58). Каждый вызов поднимает headless Chromium и заново бандлит композиции — при 10-20 инфографик-сценах это десятки запусков Chrome. В истории v5 это уже всплывало (коммит 81ac723 'perf: serialize Remotion renders (semaphore) — fix 5x Chrome thrashing' и 6c3d6b5 single-pass trim), но сам по себе per-scene CLI-рендер остаётся самым медленным местом инфографики. Таймаут 300с на вызов. На Railway с ограниченной памятью параллельный Chrome ронял билды.",
+   "recommendation": "Рассмотреть @remotion/bundler + renderMedia из Node-скрипта: забандлить композиции один раз, рендерить все сцены из одного процесса (render_infographics.py на v5, видимо, в эту сторону). Минимум — убедиться что семафор-сериализация из 81ac723 реально применяется в orchestrator-пути, а не только в rebuild-скрипте.",
+   "files": [
+    "backend/pipeline/remotion_render.py:38",
+    "backend/scripts/render_infographics.py"
+   ]
+  },
+  {
+   "title": "Весь intent-first/Remotion стек ОТСУТСТВУЕТ на integrate — это не инкремент, а ~12k строк дельты",
+   "severity": "MAJOR",
+   "detail": "git diff integrate..v5 = 100 файлов, +12796/-3742. На integrate в clips.py НЕТ ни visual_type, ни remotion, ни _download_image, ни split_scenes, ни text_overlay (grep по integrate:backend/pipeline/clips.py — пусто). Каталога remotion/ на integrate нет вообще. Дельта несёт связанные модули: scene_tagger.py(+1559, но это legacy тематических тегов для transcript_input, НЕ intent-first — не путать), vision_scorer.py(+440), visual_router.py(+150), remotion_render.py(+98), align_scenes.py, script.py переименован в script_gen.py(+84), новый script_improver.py(+663), source_verifier/cost_protection/search_cache, новый Dockerfile (multi-stage с Chromium+Node для Remotion), railway.toml с volume /app/data. Также v5 удаляет tests (backend/tests/test_pipeline.py -481, tests/test_pipeline_phases.py -480) и docs (STATUS/REFERENCE_PROMPTS/DAVINCI -322). integrate = задеплоенный master + хотфиксы зависимостей (pydantic, aiofiles, music volume).",
+   "recommendation": "Не cherry-pick по файлам. Либо мерджить v5 в integrate целиком и прогонять полный пайплайн на одном видео (massenflucht — данные есть), либо вынести visual-стек в отдельную ветку поверх integrate. Особое внимание: переименование script.py->script_gen.py сломает импорты на integrate; удаление тестов на v5 означает, что после мерджа покрытие падает в ноль — восстановить либо адаптировать тесты под новые сигнатуры (search_and_download(scene_text=), visual_type-план). Проверить Dockerfile-конфликт (на integrate его, скорее всего, нет — деплой шёл через nixpacks/иной путь).",
+   "files": [
+    "backend/pipeline/clips.py",
+    "Dockerfile",
+    "railway.toml",
+    "backend/pipeline/script_gen.py"
+   ]
+  },
+  {
+   "title": "MapWithPins захардкожен под контур Германии — не сработает для ES-канала и других гео",
+   "severity": "MINOR",
+   "detail": "MapWithPins.tsx рисует фиксированный SVG-path упрощённого контура Германии (комментарий '// Simplified Germany outline'), пины позиционируются абсолютными координатами x/y в viewBox 0 0 800 700, которые LLM задаёт в remotion_data.pins. Для DE-канала ок, но проект целит и ES-канал (CLAUDE.md: 'DE/ES'), и любая карта вне Германии (Европа, мир, Испания) ляжет на немецкий контур. LLM при этом честно отдаст координаты испанских городов — они окажутся не на той карте.",
+   "recommendation": "Либо параметризовать контур (передавать SVG-path/страну в props и держать набор контуров), либо для не-DE гео деградировать map в infographic_title/split. Сейчас medium=infographic_map для ES-контента даст визуальный мусор. Низкий приоритет до запуска ES.",
+   "files": [
+    "remotion/src/compositions/MapWithPins.tsx"
+   ]
+  },
+  {
+   "title": "Remotion-клипы video-only (-an), микс с голосом зависит от стадии assembly, которой на v5 нет под этим именем",
+   "severity": "MINOR",
+   "detail": "_render_infographic после рендера стрипает аудиодорожку Remotion через ffmpeg '-an' (clips.py:243), чтобы инфографик-клип совпадал со стоком (video-only) — корректно. Но на v5 файла backend/pipeline/assembly.py НЕТ (git show v5:backend/pipeline/assembly.py -> 'exists on disk but not in v5'); единственный pipeline-модуль рядом — remotion_render.py. Значит финальная сборка/микс голоса либо в orchestrator, либо в незакоммиченном/переименованном модуле. На integrate assembly.py есть. При мердже video-only клипы должны корректно конкатиться и микшироваться с единой голосовой дорожкой — если логика сборки на integrate ожидает аудио в каждом клипе, инфографика выпадет по звуку.",
+   "recommendation": "Перед мерджем найти, где на v5 происходит concat+audiomix (вероятно в orchestrator или uncommitted assembly), и сверить с assembly.py на integrate. Убедиться, что pipeline кладёт единую голосовую дорожку поверх конкатенированного video-only-ряда, а не ждёт аудио в clip_*.mp4.",
+   "files": [
+    "backend/pipeline/clips.py:243",
+    "backend/pipeline/remotion_render.py:1"
+   ]
+  },
+  {
+   "title": "fetch_transcripts определён, но НЕ вызывается — транскрипты конкурентов не попадают в сценарий",
+   "severity": "CRITICAL",
+   "detail": "fetch_transcripts() реализован (trending.py:328) и generate_script() умеет принимать source_transcripts (script.py:26,35-37,57), но orchestrator._phase_script вызывает generate_script БЕЗ source_transcripts (orchestrator.py:167-171). grep по всему репо подтверждает: единственные упоминания fetch_transcripts — это его собственное определение и docstring. То есть весь механизм 'транскрипты конкурентов как фактический контекст' мёртв. Сценарий пишется LLM из головы по одной строке topic — без реальных цифр/событий/имён из видео конкурентов. Это прямо бьёт по качеству 9+/10 (data-integrity правило в промптах) и по трендовости: видео не опирается на то, что реально зашло у конкурентов. Коммит 352b2f1 ('transcript context') фактически не подключён к пайплайну.",
+   "recommendation": "В discover-флоу сохранять source_url выбранной идеи, а в _phase_script вызывать fetch_transcripts([source_url], lang) и прокидывать результат в generate_script(source_transcripts=...). Минимум — в create_video принимать source_url и хранить его в VideoTask, затем тянуть транскрипт в фазе скрипта.",
+   "files": [
+    "backend/pipeline/orchestrator.py:164-171",
+    "backend/scrapers/trending.py:328-379",
+    "backend/pipeline/script.py:26-66"
+   ]
+  },
+  {
+   "title": "Разрыв discovery → создание видео: source_url, virality_score, category, hook теряются",
+   "severity": "CRITICAL",
+   "detail": "discover_channel_topics возвращает богатые идеи (title_original, hook, source_video, source_views, virality_score, category — main.py:249-259), но CreateVideoRequest принимает ТОЛЬКО topic:str (models.py, поля topic/lang/duration/style/music). Нет source_url, нет hook, нет category, нет virality_score. При запуске видео из идеи всё кроме заголовка отбрасывается. Следствия: (1) транскрипт нельзя подтянуть — потеряли URL (см. находку выше); (2) проверенный конкурентами hook не используется в сценарии; (3) virality_score нигде не сохраняется в историю, нельзя анализировать что реально выстрелило. Авто-подбор темы работает 'в стол'.",
+   "recommendation": "Расширить CreateVideoRequest и VideoTask полями source_url, hook, category (опциональные). Пробросить source_url в фазу скрипта для fetch_transcripts, а hook — как seed для первого абзаца сценария.",
+   "files": [
+    "backend/api/models.py:35-55",
+    "backend/api/main.py:245-267",
+    "backend/pipeline/orchestrator.py:27-75"
+   ]
+  },
+  {
+   "title": "yt-dlp --flat-playlist не отдаёт subscriber_count/duration — фильтры max_subs и min_duration не работают",
+   "severity": "CRITICAL",
+   "detail": "_search_youtube использует --flat-playlist (trending.py:135) и при этом запрашивает channel_follower_count, duration, view_count, upload_date (trending.py:138-143). При flat-playlist на ytsearch yt-dlp НЕ выполняет полное извлечение каждого видео — channel_follower_count и upload_date почти всегда приходят null, duration часто тоже. Код это маскирует: 'or 0' (trending.py:155-157) превращает null в 0. В итоге subs=0 (проходит max_subs всегда), upload_date='' (date-фильтр пропускает по комментарию trending.py:77-78), а --match-filter duration>=1200 на flat-плейлисте либо отсекает почти всё, либо не применяется. Фактически фильтры 'малые каналы / свежесть / длина' не отбирают НИЧЕГО по своему назначению — отбор по 'виральности у небольших каналов' не происходит. Рекомендую проверить реальным прогоном: yt-dlp --flat-playlist --print '%(channel_follower_count)s %(duration)s %(upload_date)s' 'ytsearch3:...' — увидите NA/null.",
+   "recommendation": "Убрать --flat-playlist для финального отбора (или делать двухступенчато: flat для списка URL → полный extract топ-N для метаданных). Логировать сколько видео отсеялось на каждом фильтре, чтобы фильтры были видимы. Не подменять null на 0 для subs (это инвертирует фильтр max_subs).",
+   "files": [
+    "backend/scrapers/trending.py:130-164",
+    "backend/scrapers/trending.py:71-79"
+   ]
+  },
+  {
+   "title": "Фильтр свежести бесполезен: видео без даты всегда проходят, а это большинство при flat-playlist",
+   "severity": "MAJOR",
+   "detail": "Date-фильтр (trending.py:77-78) намеренно пропускает видео с пустым upload_date ('include if date unknown'). Поскольку при --flat-playlist upload_date почти всегда пустой (см. находку про метаданные), days_back=90 де-факто отключён. 'Трендовость' (свежие темы) не обеспечивается — в выборку попадают видео любого возраста, включая 5-летние. Для финанс-ниши, где темы устаревают (крах конкретной компании, скандал), это снижает актуальность подбираемых тем.",
+   "recommendation": "После перехода на полный extract сделать date-фильтр строгим (нет даты → исключить или понизить приоритет). Добавить вторичную сортировку по views/возраст (views per day) вместо чистых views.",
+   "files": [
+    "backend/scrapers/trending.py:59-79"
+   ]
+  },
+  {
+   "title": "Сортировка только по абсолютным views — приоритет старым видео-'эвергринам', а не трендам",
+   "severity": "MAJOR",
+   "detail": "Финальный отбор: unique сортируется по view_count desc и берётся top-40 (trending.py:90), затем top-30 в анализ паттернов (trending.py:176). Абсолютные просмотры дают преимущество старым видео (накопили за годы), а не свежим взлетающим. Для поиска ТРЕНДА нужна метрика скорости — views/день с момента загрузки. Сейчас pattern-анализ учится на 'вечных хитах', а не на том что выстреливает сейчас. Это противоречит цели зоны (трендовые темы).",
+   "recommendation": "Считать velocity = view_count / max(days_since_upload, 1) и сортировать/фильтровать по ней. В промпт _analyze_patterns добавить velocity рядом с views, чтобы LLM видел что именно набирает быстро.",
+   "files": [
+    "backend/scrapers/trending.py:84-92",
+    "backend/scrapers/trending.py:170-177"
+   ]
+  },
+  {
+   "title": "virality_score — субъективная оценка LLM, не калибрована и не валидируется фидбэком",
+   "severity": "MAJOR",
+   "detail": "virality_score ставит сам LLM по текстовой шкале в промпте (trending.py:247,252-256), затем нормализуется (clamp 0-100, trending.py:286) и по нему сортировка (trending.py:292). Проблемы: (1) нет привязки к реальным метрикам конкурентов — LLM не считает views/velocity, просто 'на глаз'; (2) standalone-фолбэк генерит score вообще без данных конкурентов (trending.py:309-313), но score попадает в тот же рейтинг — несопоставимые шкалы смешиваются; (3) нет обратной связи: фактический успех выпущенного видео нигде не сравнивается с предсказанным score (история хранит только topic-строки, get_channel_history). Score выглядит точным (целое 0-100), но это иллюзия точности.",
+   "recommendation": "Сделать score композитным: часть от реальных метрик источника (нормализованный velocity), часть от LLM. Помечать standalone-идеи отдельным флагом/штрафом, чтобы не конкурировали наравне. Хранить в истории {topic, predicted_score, source_url} для последующей калибровки.",
+   "files": [
+    "backend/scrapers/trending.py:240-294",
+    "backend/scrapers/trending.py:297-325"
+   ]
+  },
+  {
+   "title": "search_queries для DE заужены и дублируют друг друга — слабое покрытие свежих тем",
+   "severity": "MAJOR",
+   "detail": "10 DE-запросов (channels.yaml:32-42) почти все вокруг 'Aufstieg und Fall / Skandal / Insolvenz Dokumentation'. Сильный перекос на исторические корпоративные крахи, мало про актуальные триггеры финанс-ниши: инфляция, недвижимость/Immobilien, рента/Altersvorsorge, крипто, конкретные имена (Wirecard, Adler, Signa/Benko, Varta). Нет запросов с годом/'2025'/'aktuell', нет 'Reichtum/Vermögen', 'Steuern Trick', 'Crash'. Это сужает воронку до узкого сегмента и снижает шанс поймать трендовую тему. niche_keywords (channels.yaml:8-14) при этом вообще не используются в поиске (grep niche_keywords → только определение).",
+   "recommendation": "Расширить и диверсифицировать queries: добавить актуальные триггеры и имена, добавить год/'aktuell' в часть запросов, добавить кластеры (недвижимость, инфляция, крипто, личные финансы). Задействовать niche_keywords для авто-генерации части запросов. Периодически ротировать запросы.",
+   "files": [
+    "backend/config/channels.yaml:32-42",
+    "backend/config/channels.yaml:8-14"
+   ]
+  },
+  {
+   "title": "Анти-повтор тем работает по сырым строкам — легко обходится перефразировкой",
+   "severity": "MAJOR",
+   "detail": "Исключение прошлых тем строится списком строк в промпт (trending.py:218-223) плюс проверка в create_video через точное сравнение rt.lower()==topic_lower (main.py:297-300, только warning, не блок). История — это просто list[str] topic'ов (config __init__.py:92-102). LLM получает запрет в промпте, но семантически близкую тему ('Wirecard Skandal' vs 'Der Betrug von Wirecard') ни промпт-инструкция, ни точное сравнение не поймают. Разнообразие vs история канала держится только на доброй воле LLM. Нет проверки на пересечение по category, нет дедупа по сущности/компании.",
+   "recommendation": "Добавить семантическую дедупликацию: либо отдельным LLM-шагом 'эти идеи дублируют historic topics? убери', либо эмбеддинг-сходством. Хранить в истории category и ключевую сущность, балансировать category в выдаче (не 8 из 10 business_rise_fall).",
+   "files": [
+    "backend/scrapers/trending.py:217-223",
+    "backend/api/main.py:290-300",
+    "backend/config/__init__.py:92-115"
+   ]
+  },
+  {
+   "title": "Дедупликация видео по точному заголовку — переупаковки/reup и одинаковые темы с разных каналов проходят дважды",
+   "severity": "MINOR",
+   "detail": "Дедуп идёт по точному совпадению title (trending.py:84-89). Один и тот же сюжет с разными заголовками ('Der Fall Wirecard' / 'Wirecard: Wie alles zusammenbrach') попадёт дважды и перевесит pattern-анализ в сторону одной темы. Нет дедупа по каналу/url. Это смещает 'паттерн' и сужает разнообразие источников.",
+   "recommendation": "Дедуп по url И по нормализованному заголовку (lower, без пунктуации, первые N слов). Опционально ограничить max видео с одного канала, чтобы паттерн не перекашивался одним автором.",
+   "files": [
+    "backend/scrapers/trending.py:83-90"
+   ]
+  },
+  {
+   "title": "category из промпта может не совпасть с enum, source_views/url не валидируются — мусор в выдаче без отсева",
+   "severity": "MINOR",
+   "detail": "category берётся из LLM-ответа как есть (trending.py:284) при том что промпт перечисляет фикс-набор (trending.py:245) — LLM может вернуть произвольную строку, downstream нигде не проверяет принадлежность к enum. source_views ожидается int, но кладётся без приведения (trending.py:289) — если LLM вернёт '120K' или строку, попадёт в ответ как есть. min/max clamp есть только для virality_score. Это тихо снижает качество данных идей (нельзя надёжно фильтровать/группировать по category).",
+   "recommendation": "Валидировать category по списку допустимых (иначе 'other'), приводить source_views к int с try/except, логировать отбракованные поля.",
+   "files": [
+    "backend/scrapers/trending.py:277-294"
+   ]
+  },
+  {
+   "title": "Все search_queries в анализе — недетерминированный объём LLM-вызова и риск таймаута/стоимости",
+   "severity": "MINOR",
+   "detail": "Комментарий 'run all queries for better coverage' (trending.py:63) — это 10 yt-dlp вызовов по 25 результатов = до 250 видео, каждый поиск с timeout=90с последовательно (не параллельно). В худшем случае ~15 минут только на поиск, синхронный subprocess.run внутри async без to_thread (блокирует event loop). При этом в анализ всё равно идут только top-30. Цена/латентность discovery высокая, а выигрыш ограничен отсечкой top-40/30.",
+   "recommendation": "Распараллелить _search_youtube через asyncio + subprocess в executor (сейчас subprocess.run блокирует loop). Ограничить число запросов или ранний выход при достижении N кандидатов. Это снизит латентность и стоимость без потери качества.",
+   "files": [
+    "backend/scrapers/trending.py:62-92",
+    "backend/scrapers/trending.py:146-147"
+   ]
+  },
+  {
+   "title": "fetch_transcripts берёт первый попавшийся .vtt — может взять не тот язык/чужого видео",
+   "severity": "MINOR",
+   "detail": "При скачивании субтитров sub_lang='de,en' может создать несколько .vtt (de и en), а код берёт sorted(...)[0] (trending.py:360,365) — то есть алфавитно первый файл, без гарантии что это нужный язык или нужное видео (в одной tmp-папке последовательные итерации, но шаблон %(id)s разделяет — ок; язык — нет). Для немецкого канала важнее немецкий транскрипт. Также 5000 симв/видео × 3 = 15k симв в контекст — нормально, но без приоритета по языку контекст может оказаться на английском.",
+   "recommendation": "Выбирать .vtt с приоритетом целевого языка (фильтровать по '.de.vtt' прежде чем '.en.vtt'). Логировать какой язык реально взят.",
+   "files": [
+    "backend/scrapers/trending.py:341-366"
+   ]
+  },
+  {
+   "title": "Нет ретеншн/CTR-сигнала: pattern-анализ строится только на заголовках и просмотрах",
+   "severity": "IMPROVEMENT",
+   "detail": "_analyze_patterns кормит LLM список title+views+subs+duration (trending.py:171-177) и просит вывести FORMAT INSIGHTS / что удерживает зрителя (trending.py:191). Но у пайплайна есть fetch_transcripts, который мог бы дать реальную структуру удачных видео (как начинают, где повороты). Сейчас 'что удерживает в 20-мин видео' — это галлюцинация LLM по заголовкам. Подключив транскрипты top-видео к pattern-анализу, можно получить реальные хук-формулы и структуру, а не догадки.",
+   "recommendation": "Перед _analyze_patterns тянуть транскрипты top-3 и добавлять их выжимку в промпт анализа паттернов (первые 1-2 мин = реальный hook конкурента). Это поднимет и качество паттернов, и трендовость идей.",
+   "files": [
+    "backend/scrapers/trending.py:167-200",
+    "backend/scrapers/trending.py:328-379"
+   ]
+  },
+  {
+   "title": "TTS-конкатенация через amix уничтожает озвучку любого видео >5000 символов (весь продакшн)",
+   "severity": "CRITICAL",
+   "detail": "_concatenate_audio для >1 чанка строит filter_complex с adelay + amix=inputs=N:duration=longest. amix НЕ склеивает чанки последовательно — он МИКСИРУЕТ их одновременно (накладывает друг на друга). Каждый чанк после первого сдвигается только на i*pause (0.4с, 0.8с...), а не на сумму длительностей предыдущих. Эмпирически проверено: 6 чанков по 30с (должно быть ~180с речи) дают файл 32с с одновременно звучащими голосами; 2 чанка по 2с → 2.43с вместо 4с. Плюс amix нормализует амплитуду делением на N → падение громкости ~4-6 dB. Видео 22 мин = target ~20020 символов (DE: 22*910) при chunk_size=5000 = ~5 чанков, поэтому баг бьёт КАЖДЫЙ реальный прогон 20-25 мин. Single-chunk путь (shutil.copy2) работает только для коротких текстов <5000 символов. Каскад: _get_audio_duration вернёт неверную (укороченную) длительность → она идёт в task.voiceover_duration → alignment получит обрезанный аудиопоток, Deepgram затранскрибирует мешанину → align_scenes_to_words не сматчит ничего → proportional fallback по неверной длительности. Итог: видео с кашей из голосов и съехавшими сценами.",
+   "files": [
+    "backend/pipeline/tts.py:322-356",
+    "backend/pipeline/tts.py:337-346",
+    "backend/pipeline/tts.py:87"
+   ],
+   "recommendation": "Заменить adelay+amix на корректную последовательную конкатенацию. Вариант A (проще и надёжнее): между чанками вставлять тишину apad/anullsrc нужной длины и склеивать через filter concat (a=1:v=0), либо генерировать промежуточный silence.mp3 на pause секунд и делать concat demuxer (-f concat -safe 0 -i list.txt). Вариант B: [0][s][1][s][2]...concat=n=2N-1:v=0:a=1. Добавить тест: склеить 3 known-длительности чанка и проверить что сумма длительностей == ~ sum(parts)+pause*(N-1) с допуском 0.2с."
+  },
+  {
+   "title": "Частичное аудио при падении одного TTS-чанка — прогон валится, готовые чанки теряются",
+   "severity": "MAJOR",
+   "detail": "В generate_voiceover цикл по чанкам (for i, chunk) синтезирует каждый чанк по очереди; если _synthesize_chunk_dispatch на чанке 4 из 5 бросит исключение (fal 5xx после которого Voicer/Edge тоже недоступны, или Edge не установлен в проде — 'pip install edge-tts'), исключение всплывёт наружу, фаза voiceover упадёт. Чекпоинт фазы НЕ выставится (orchestrator ставит checkpoint[phase]=True только при успехе), поэтому при resume вся озвучка (включая 4 уже синтезированных и оплаченных через fal чанка) переделывается с нуля. На масштабе (десятки видео) это деньги и время. Также dispatch при fal-фейле молча уходит на Edge (логирует warning) — если Edge есть, видео озвучится дешёвым голосом Microsoft вместо ElevenLabs, и клиент об этом узнает только постфактум по звуку.",
+   "files": [
+    "backend/pipeline/tts.py:67-79",
+    "backend/pipeline/tts.py:183-210",
+    "backend/pipeline/orchestrator.py:147-157"
+   ],
+   "recommendation": "Кэшировать уже синтезированные чанки на диске (tts_chunk_NNN.mp3 не удалять до успешной финальной склейки; при старте фазы пропускать существующие непустые чанки). Параллелить чанки через asyncio.gather с ограничением семафором — ускорит и изолирует ретраи. Логировать факт деградации провайдера в task (например task.checkpoint['tts_provider']) чтобы видеть когда сработал Edge-фолбэк."
+  },
+  {
+   "title": "call_llm может вернуть None как content → крах далее по цепочке (script len(), .strip())",
+   "severity": "MAJOR",
+   "detail": "call_llm возвращает data['choices'][0]['message']['content'] напрямую (llm.py:71-75). На OpenRouter некоторые модели/случаи (finish_reason=length с пустым выводом, content-filter, reasoning-модели где текст в 'reasoning' а content=null) возвращают content=null. Тогда generate_script на строке 79 делает len(script) от None → TypeError; plan_scenes делает response.strip() от None → AttributeError; improve_script передаёт None дальше. Это не теоретично: при длинных промптах сценария (template + source_context из транскриптов может быть очень большим) модель упирается в лимит и отдаёт пустое/обрезанное. Также нет проверки на пустую строку '' — script='' пройдёт как валидный, длина 0 < min_chars запустит 2 continuation-попытки на основе пустого хвоста, и в итоге вернётся почти пустой сценарий, который дальше TTS озвучит как тишину.",
+   "files": [
+    "backend/utils/llm.py:71-75",
+    "backend/pipeline/script.py:69-102",
+    "backend/pipeline/clips.py:80-85"
+   ],
+   "recommendation": "В call_llm: после извлечения content проверить `if not content: last_error=RuntimeError('empty content from {model}'); break` (уйти на fallback-модель/ретрай) вместо возврата None/''. Дополнительно вернуть content.strip() или явно валидировать непустоту. В generate_script добавить guard: если после всех попыток len(script.strip()) мало — поднять понятную ошибку, а не отдавать пустышку в TTS."
+  },
+  {
+   "title": "source_context из транскриптов раздувает промпт без лимита → 400/таймаут на длинных сценариях",
+   "severity": "MAJOR",
+   "detail": "_build_source_context конкатенирует ПОЛНЫЕ транскрипты всех источников (parts.append(f'...{transcript}') — без обрезки). Транскрипт одного YouTube-видео 20 мин = 15-25k символов; 3-5 источников = до 100k+ символов в промпт сценария. Это: (1) риск 400 Bad Request по context-length модели (llm.py ловит 400 и сразу уходит на fallback, но fallback с тем же раздутым промптом тоже упадёт → весь генератор сценария падает), (2) рост стоимости и латентности, (3) выше шанс что модель отдаст обрезанный/пустой ответ (см. находку про None). Никакого budget/truncation на источники нет.",
+   "files": [
+    "backend/pipeline/script.py:288-324",
+    "backend/pipeline/script.py:319-322",
+    "backend/utils/llm.py:62-66"
+   ],
+   "recommendation": "Ограничить суммарный размер source_context (например, обрезать каждый транскрипт до N символов и/или ограничить число источников), логировать итоговую длину промпта перед call_llm. Желательно считать примерные токены и сравнивать с лимитом модели."
+  },
+  {
+   "title": "continuation-логика в generate_script хардкодит немецкий промпт для всех языков",
+   "severity": "MINOR",
+   "detail": "При коротком сценарии (len < min_chars=target*0.8) запускается continuation, но промпт-инструкция написана по-немецки ('Du hast ein Skript angefangen... Schreibe die FORTSETZUNG...') независимо от lang. Для ES/EN-каналов модель получит немецкие инструкции — может ответить по-немецки или сбиться на язык инструкции, что испортит ES/EN сценарий. Так как ES voice_id пустой и канал в разработке, сейчас бьёт в основном EN.",
+   "files": [
+    "backend/pipeline/script.py:85-99"
+   ],
+   "recommendation": "Локализовать continuation-промпт по lang (словарь {de/es/en}) либо писать его на английском с явным указанием 'continue in {language}'."
+  },
+  {
+   "title": "Оверсайз-предложение даёт чанк больше chunk_size → отказ TTS-провайдера",
+   "severity": "MINOR",
+   "detail": "_split_into_chunks режет только по границам предложений (по '. '). Если одно 'предложение' длиннее max_size (5000) — например, длинный абзац без точек, список через запятую, или текст где '. ' не встречается — оно целиком уходит одним чанком >5000 символов. Условие `len(current)+len(sent)+1 > max_size and current` не делит сам sent. ElevenLabs/fal v3 имеют лимит на длину запроса → чанк отклонится, чанк упадёт (см. находку про частичное аудио). На сгенерированных LLM-сценариях редко, но при правке голоса/нестандартном вводе реально.",
+   "files": [
+    "backend/pipeline/tts.py:131-150",
+    "backend/pipeline/tts.py:143"
+   ],
+   "recommendation": "Добавить жёсткое разбиение предложения, если оно само > max_size (резать по словам/символам с overlap=0). Логировать предупреждение когда такое произошло."
+  },
+  {
+   "title": "Alignment: cursor только двигается вперёд → одна ложная привязка ломает все последующие сцены",
+   "severity": "MINOR",
+   "detail": "align_scenes_to_words ищет head сцены начиная строго с cursor (j in range(cursor, ...)) и после матча ставит cursor = end_idx+1. Если у сцены K end_idx_in_words оценён по len(scene_tokens) (а не по реальному концу), cursor может перепрыгнуть начало сцены K+1 → её head уже 'позади' cursor → not found → сцена пропущена → дальше каскадом. Особенно при повторяющихся первых 3 словах сцен (частые зачины вроде 'Aber das war') ранний ложный матч уводит cursor. min_match_words=3 + loose 2-словный матч повышают шанс ложного якоря. Падения нет (есть _fill_gaps + proportional fallback), но тайминги съезжают тихо — клипы не попадают на нужный текст. Деградация качества без сигнала.",
+   "files": [
+    "backend/pipeline/align_scenes.py:124-146",
+    "backend/pipeline/align_scenes.py:143-146"
+   ],
+   "recommendation": "Логировать долю несматченных сцен как warning при превышении порога (например >30%). Рассмотреть поиск head в небольшом окне вокруг ожидаемой позиции, а не строго от cursor; либо матчить и хвост сцены для проверки. Это улучшение точности, не краш-фикс."
+  },
+  {
+   "title": "improve_script: мёртвый код hasattr(generate_script,'__wrapped__') и нет length-guard",
+   "severity": "MINOR",
+   "detail": "В improve_script на строках 150-152 комментарий 'Length guard: warn if script drifts >15%' и `if hasattr(generate_script,'__wrapped__'): pass # skip in tests` — это ничего не делает (pass), guard не реализован. Реальная проблема за этим: LLM-улучшение (особенно итерация с инструкцией 'каждое предложение <25 слов', 'убери AI-фразы') регулярно СОКРАЩАЕТ сценарий. После 2-3 итераций сценарий может усохнуть значительно ниже целевого, и видео выйдет короче 20 мин — без какой-либо проверки. _score_script штрафует за <10000 символов, но improve_script может остановиться по достижению score>=85 и при этом отдать укороченный текст.",
+   "files": [
+    "backend/pipeline/script.py:150-152",
+    "backend/pipeline/script.py:105-154"
+   ],
+   "recommendation": "Убрать мёртвый if/pass. Реализовать реальный guard: если после итерации len(current) < len(script)*0.85 — откатиться к предыдущей версии или залогировать критический warning и не применять итерацию. Привязать к фактической целевой длине."
+  },
+  {
+   "title": "Deepgram nova-2 захардкожен для всех языков; ru/pl могут не поддерживаться этой моделью",
+   "severity": "MINOR",
+   "detail": "transcribe_with_words(model='nova-2') по умолчанию для всех языков из DG_LANG_MAP (включая ru, pl). Покрытие языков у nova-2 ограничено; для части языков Deepgram требует nova-2-general/enhanced/base или иную модель, иначе вернёт 400. Сейчас при 400 поднимается RuntimeError → перехватывается в realign_scene_plan и уходит в proportional fallback (не краш), но alignment по сути отключается тихо для этих языков — клипы съезжают. Каналы заявлены DE/ES (поддерживаются), так что severity низкая, но при расширении на ru/pl ударит.",
+   "files": [
+    "backend/pipeline/align_scenes.py:46-63",
+    "backend/pipeline/align_scenes.py:31"
+   ],
+   "recommendation": "Вынести модель Deepgram в конфиг per-language и при 400 логировать явно 'alignment disabled for lang=X, проверь модель Deepgram', чтобы деградация была видимой."
+  },
+  {
+   "title": "save_checkpoint() стирает metadata/delivery/created_at/style/music_mood при каждой записи",
+   "severity": "CRITICAL",
+   "detail": "VideoTask.save_checkpoint (orchestrator.py:68-84) делает json.dump полным набором из 9 фиксированных ключей (task_id, topic, lang, duration_minutes, output_mode, status, current_phase, error, checkpoint, updated_at). Он ПОЛНОСТЬЮ перезаписывает файл, не читая существующий. Поэтому: 1) created_at, который POST /videos записал при создании (main.py:328), теряется при первом же save_checkpoint в run() → в списке/деталях видео created_at становится null. 2) style и music_mood, записанные при создании (main.py:322-324), стираются. 3) Самое важное — _phase_metadata дописывает cp_data['metadata'] (orchestrator.py:339-345), но сразу после возврата из фазы run() вызывает task.save_checkpoint() (orchestrator.py:150), который НЕ содержит ключа metadata → titles/description/tags стираются из чекпоинта. В _checkpoint_to_response (main.py:98,113-115) они тянутся из cp['metadata'], значит API всегда отдаёт titles/description/tags = null, хотя фаза metadata их сгенерировала и записала. Для fcpxml-режима (output_mode по умолчанию, models.py:14) после metadata идёт фаза delivery, и завершающий save_checkpoint на строке 161 окончательно затирает и metadata, и delivery.",
+   "recommendation": "Сделать save_checkpoint read-modify-write: читать существующий checkpoint.json, обновлять только свои поля (status/current_phase/error/checkpoint/updated_at), не трогая metadata, delivery, created_at, style, music_mood. Либо добавить эти поля в дату-класс VideoTask и в save_checkpoint, чтобы они переживали запись. Минимум — слить с диска перед json.dump.",
+   "files": [
+    "backend/pipeline/orchestrator.py:68-84",
+    "backend/pipeline/orchestrator.py:150",
+    "backend/pipeline/orchestrator.py:161",
+    "backend/pipeline/orchestrator.py:338-345",
+    "backend/api/main.py:98",
+    "backend/api/main.py:113-115",
+    "backend/api/main.py:328"
+   ]
+  },
+  {
+   "title": "Неатомарная запись checkpoint.json → reader ловит пустой/битый JSON под нагрузкой",
+   "severity": "MAJOR",
+   "detail": "Все записи в checkpoint.json делаются через open(path,'w') + json.dump БЕЗ временного файла и os.replace (orchestrator.py:83-84, 344-345, 368-369; main.py:316-330, 400-405; recover на 175-176). open('w') обнуляет файл мгновенно, json.dump пишет постепенно. Параллельно WS-цикл (main.py:421) и list_videos (main.py:348) и _find_workspace_by_task_id (main.py:123) читают тот же файл раз в секунду / на каждый HTTP-запрос. Если чтение попадёт между truncate и завершением dump — json.load бросит исключение. В _read_checkpoint оно проглатывается и возвращается None (main.py:82-83), из-за чего: WS отправит клиенту {'error':'Checkpoint not readable'} и закроет сокет (main.py:432-433) — прогресс на сайте оборвётся посреди генерации; get_video вернёт 404 (main.py:357); list_videos молча пропустит задачу из списка. Это не теория — записи во время активной генерации идут постоянно (на каждую фазу 2-3 раза), а WS поллит ежесекундно.",
+   "recommendation": "Писать атомарно: dump во временный файл в той же директории + os.replace(tmp, checkpoint.json). os.replace атомарен на одном ФС. Завести единый хелпер write_checkpoint и использовать везде (orchestrator + main). Это убьёт и проблему частичного чтения, и часть гонок из находки про metadata.",
+   "files": [
+    "backend/pipeline/orchestrator.py:83-84",
+    "backend/api/main.py:80-83",
+    "backend/api/main.py:316-330",
+    "backend/api/main.py:421-433"
+   ]
+  },
+  {
+   "title": "WebSocket навсегда обрывает прогресс при единичной ошибке чтения чекпоинта",
+   "severity": "MAJOR",
+   "detail": "В ws_progress (main.py:431-433) ветка else (cp is None) отправляет {'error':'Checkpoint not readable'} и делает break — выход из цикла и закрытие сокета. Но cp == None возникает не только при отсутствии файла, а и при ЛЮБОМ временном сбое чтения: частичная запись (см. находку про атомарность), кратковременная блокировка ФС на Railway-томе, гонка с переименованием. Одна такая осечка навсегда рвёт WS, фронт перестаёт получать прогресс до ручного reconnect, хотя генерация продолжается. Аналогично: если задачу ещё не нашли (ws_dir is None на старте, main.py:414-417) — сокет сразу закрывается, хотя POST /videos создаёт чекпоинт синхронно до возврата, но при гонке открытия WS сразу после POST на распределённом ФС файл может быть ещё не виден.",
+   "recommendation": "Не делать break при cp is None — логировать и continue (с counter, чтобы после N подряд неудач закрыть). Состояние 'файл пока не читается' трактовать как transient, а не terminal. Терминальными считать только status in (completed/failed/cancelled).",
+   "files": [
+    "backend/api/main.py:414-417",
+    "backend/api/main.py:431-433"
+   ]
+  },
+  {
+   "title": "Отмена задачи не прерывает реальную работу — фоновый таск переживёт cancel",
+   "severity": "MAJOR",
+   "detail": "DELETE /videos/{id} (main.py:385-405) вызывает bg_task.cancel() и пишет status='cancelled'. Но pipeline.run() и фазы НЕ имеют точек проверки отмены и состоят в основном из await на внешние API (LLM, TTS, скачивание клипов) и блокирующих subprocess.run FFmpeg в assembly. asyncio.cancel доставляет CancelledError только на ближайшем await; долгий FFmpeg (запущенный синхронно через subprocess.run внутри потока/корутины) не прервётся. Хуже: финальный блок run() ловит общий Exception (orchestrator.py:152) и _run_pipeline тоже (main.py:150-155) — CancelledError в Python 3.8+ наследник BaseException и не ловится except Exception, так что отмена пройдёт, НО save_checkpoint в except не сработает корректно при частично выполненной фазе. Плюс гонка статусов: DELETE ставит 'cancelled', а если фаза успела упасть — _run_pipeline ставит 'failed' (main.py:152-154), либо наоборот cancelled перетрётся последующим save_checkpoint фазы. Итог для UX: пользователь видит 'cancelled', а генерация (и расход денег на LLM/TTS) продолжается ещё минуты.",
+   "recommendation": "Передавать в pipeline.run/фазы asyncio.Event (cancel flag) или проверять task.status между фазами в run() (orchestrator.py:137) и бросать CancelledError. Для FFmpeg — запускать через asyncio.create_subprocess_exec с возможностью kill процесса при отмене. После cancel принудительно фиксировать status='cancelled' последней записью.",
+   "files": [
+    "backend/api/main.py:385-405",
+    "backend/pipeline/orchestrator.py:132-162",
+    "backend/pipeline/orchestrator.py:152-157"
+   ]
+  },
+  {
+   "title": "Утечка/потеря background-задач: _running_tasks теряется при рестарте, нет учёта завершённых с ошибкой",
+   "severity": "MAJOR",
+   "detail": "_running_tasks — обычный in-memory dict (main.py:60). При рестарте контейнера Railway он обнуляется, фоновые asyncio.Task убиваются, но checkpoint остаётся 'running'. recover_orphaned_tasks (main.py:161-180) частично лечит это, помечая running→failed на старте — ОК. Но: 1) DELETE для задачи, поднятой прошлым контейнером, не найдёт её в _running_tasks (main.py:390) → cancel не вызовется, хотя статус всё ещё 'running' до следующего рестарта. 2) asyncio.create_task (main.py:333) — на возвращаемый объект нет защиты от GC помимо _running_tasks; это ок пока он в dict, но _run_pipeline удаляет себя из dict в finally (main.py:157) ещё ДО того как корутина реально завершилась бы при исключении вне try — на практике fine, но exception_handler не навешан, так что необработанное исключение в bg-таске уйдёт только в дефолтный asyncio лог. 3) Нет ограничения на число параллельных генераций — N одновременных POST запустят N тяжёлых FFmpeg/LLM пайплайнов, что положит контейнер по CPU/RAM (UX: все зависнут).",
+   "recommendation": "Добавить семафор/очередь на число одновременных пайплайнов. Навесить bg_task.add_done_callback для логирования необработанных исключений. recover_orphaned_tasks уже есть — оставить. Для DELETE по running-задаче без записи в _running_tasks хотя бы корректно ставить cancelled в чекпоинт (это делается, но реальная работа в другом контейнере не остановится — задокументировать ограничение).",
+   "files": [
+    "backend/api/main.py:60",
+    "backend/api/main.py:332-334",
+    "backend/api/main.py:157",
+    "backend/api/main.py:385-397"
+   ]
+  },
+  {
+   "title": "skip_completed + потеря пути к артефактам при resume фаз",
+   "severity": "MAJOR",
+   "detail": "load_checkpoint (orchestrator.py:86-104) восстанавливает task.checkpoint (флаги фаз), но НЕ восстанавливает пути-артефакты: script_path, improved_script_path, voiceover_path, voiceover_duration, scene_plan_path, clip_map_path, music_path (поля dataclass orchestrator.py:44-52, в save_checkpoint не сохраняются). При resume с skip_completed=True (run вызывается с ним из main.py:147) пропущенные фазы НЕ выполнятся, а значит эти поля останутся None. Тогда последующая невыполненная фаза упадёт: напр. если script_generation+improvement+virality помечены done, но voiceover нет — _phase_tts читает task.improved_script_path (None) → fallback на script_path (тоже None) → Path(None) бросит TypeError. Аналогично _phase_clips читает task.scene_plan_path=None. Фактически resume после рестарта посреди пайплайна сломается на первой же невыполненной фазе, хотя файлы на диске есть. При этом recover_orphaned_tasks помечает прерванные как 'failed' (main.py:171-173), но если пользователь/код попытается перезапустить — путь восстановления нерабочий.",
+   "recommendation": "Либо сохранять пути-артефакты в checkpoint и восстанавливать в load_checkpoint, либо в каждой фазе детерминированно вычислять путь из workspace (script.txt, viral_script.txt, scene_plan.json и т.д.) вместо опоры на task.*_path. Второе устойчивее к resume. Сейчас resume фактически не работает за пределами фаз, не зависящих от предыдущих путей.",
+   "files": [
+    "backend/pipeline/orchestrator.py:44-52",
+    "backend/pipeline/orchestrator.py:86-104",
+    "backend/pipeline/orchestrator.py:201-205",
+    "backend/pipeline/orchestrator.py:247-264",
+    "backend/api/main.py:147"
+   ]
+  },
+  {
+   "title": "Двойная обработка ошибки фазы: error может потеряться или задвоиться",
+   "severity": "MINOR",
+   "detail": "При падении фазы run() ставит status='failed', error='phase: msg' и save_checkpoint (orchestrator.py:152-157), затем re-raise. _run_pipeline ловит Exception и проверяет if task.status != 'failed' прежде чем снова ставить failed (main.py:150-155) — защита от перезаписи есть, ОК. Но: task в _run_pipeline и task внутри pipeline.run — один объект, поэтому task.status уже 'failed' и второй save не сработает (правильно). Проблема в формулировке error: orchestrator пишет 'phase_name: str(e)' (стр.154), а полезная причина часто во вложенном исключении. Плюс при ошибке в _phase_metadata/_phase_delivery, где идёт ручная дозапись cp_data (стр.339-345, 362-369), если json.load существующего файла упадёт (битый файл) — это исключение всплывёт как ошибка фазы и маскирует реальную причину. Для UX: пользователь увидит 'metadata: ...' вместо настоящей проблемы.",
+   "recommendation": "Логировать полный traceback (logger.exception) при падении фазы. Ручную дозапись metadata/delivery обернуть в try/except, чтобы сбой записи чекпоинта не маскировал успешную фазу (для metadata это критично — фаза реально отработала). Это пересекается с переходом на атомарную запись.",
+   "files": [
+    "backend/pipeline/orchestrator.py:152-157",
+    "backend/api/main.py:150-155",
+    "backend/pipeline/orchestrator.py:338-345"
+   ]
+  },
+  {
+   "title": "progress_percent считается по 9 фазам, а пайплайн имеет 11 → прогресс врёт",
+   "severity": "MINOR",
+   "detail": "PIPELINE_PHASES в main.py:62-66 содержит 9 имён (script_generation, script_improvement, virality_filter, voiceover, scene_planning, clip_download, music, assembly, metadata). Но Pipeline.phases (orchestrator.py:118-130) содержит 11 фаз и в другом порядке: добавлены 'alignment' и 'delivery', а scene_planning идёт ДО voiceover. _phase_progress (main.py:69-72) считает done как долю выполненных из этих 9 имён. Поскольку оркестратор пишет в checkpoint флаги по своим именам ('alignment', 'delivery' тоже), а прогресс-бар их игнорирует — максимум по факту достижимый процент при завершении всех 11 фаз = 9/9=100% только если все 9 совпадающих имён выставлены, но 'alignment' и 'delivery' не учитываются, из-за чего прогресс скачет и не отражает реальные тяжёлые фазы (alignment/delivery занимают время, но не двигают бар). UX: бар может показать 100% пока ещё идут alignment→delivery, или застрять. Также order рассинхрон: scene_planning у API стоит после voiceover, у оркестратора — до.",
+   "recommendation": "Считать прогресс из фактического списка Pipeline.phases (импортировать или продублировать ровно те же 11 имён в том же порядке), а лучше вычислять долю по индексу current_phase в реальном списке фаз, а не по словарю флагов. Синхронизировать PIPELINE_PHASES с orchestrator.phases.",
+   "files": [
+    "backend/api/main.py:62-72",
+    "backend/pipeline/orchestrator.py:118-130"
+   ]
+  },
+  {
+   "title": "_find_workspace_by_task_id линейно сканирует все workspace и читает каждый checkpoint",
+   "severity": "MINOR",
+   "detail": "_find_workspace_by_task_id (main.py:119-126) на каждый GET /videos/{id}, /download, DELETE и при старте WS итерирует ВСЕ директории в OUTPUT_DIR и парсит каждый checkpoint.json пока не найдёт нужный. При накоплении задач это O(N) дисковых чтений на запрос, а WS вызывает его один раз на старте — терпимо, но get_video может дёргаться фронтом часто. На персистентном томе Railway с десятками-сотнями старых workspace это заметная задержка и лишний шанс наткнуться на частично записанный чекпоинт (см. атомарность). Имя workspace уже содержит task_id как суффикс (orchestrator.py:64: f'{safe_topic}_{lang}_{task_id}'), так что O(N)-скан избыточен.",
+   "recommendation": "Искать workspace по суффиксу имени (glob f'*_{task_id}') вместо чтения всех чекпоинтов, либо держать in-memory индекс task_id→workspace, обновляемый при создании и при старте. Это снизит и нагрузку, и вероятность ловить битый JSON.",
+   "files": [
+    "backend/api/main.py:119-126",
+    "backend/pipeline/orchestrator.py:64"
+   ]
+  },
+  {
+   "title": "CORS allow_origins=['*'] вместе с WebSocket и без аутентификации",
+   "severity": "IMPROVEMENT",
+   "detail": "CORSMiddleware с allow_origins=['*'], allow_methods=['*'], allow_headers=['*'] (main.py:50-55). Эндпоинты создают/удаляют задачи (POST/DELETE) и запускают платные LLM/TTS-пайплайны без какой-либо аутентификации. Любой сайт/скрипт может с публичного URL Railway запускать генерации и тратить бюджет (CLAUDE.md: цель <=100$/мес). Для read-only анализа это не баг рантайма, но прямой риск для UX/денег: открытый POST /api/v1/videos == открытый кран расходов.",
+   "recommendation": "Ограничить allow_origins конкретным доменом фронта. Добавить простую защиту на мутирующие эндпоинты (API-ключ в заголовке / basic auth), хотя бы на POST/DELETE. Связать с находкой про лимит параллельных задач.",
+   "files": [
+    "backend/api/main.py:50-55",
+    "backend/api/main.py:286-287",
+    "backend/api/main.py:385-386"
+   ]
+  },
+  {
+   "title": "Минимальный визуальный стек: всего 4 модуля + remotion/, а НЕ весь diff v5",
+   "severity": "IMPROVEMENT",
+   "detail": "Из 55 изменённых файлов в git diff integrate..v5 для intent-first визуала реально нужны лишь: backend/pipeline/clips.py (intent-first plan_scenes + диспетчер _render_infographic/_download_image/_burn_overlay), backend/visual_router.py (мульти-сорс поиск, чистый stdlib+os.environ), backend/pipeline/vision_scorer.py (нужна ТОЛЬКО функция score_thumbnail), backend/pipeline/remotion_render.py (npx-обёртка), backend/stock/multi.py (адаптер над visual_router) и весь remotion/* (TS-композиции). Граф зависимостей проверен: orchestrator вызывает clips.plan_scenes/download_clips → multi.MultiStockClient → visual_router + vision_scorer.score_thumbnail; clips → remotion_render.render_for_scene → remotion/. Всё остальное (scene_tagger.py 1559 стр, transcript_input.py 4528 стр, archive.py, wikimedia.py, source_verifier, cost_protection, search_cache, cinematic_preprocess) в этот путь НЕ входит.",
+   "files": [
+    "backend/pipeline/clips.py:239",
+    "backend/pipeline/clips.py:269",
+    "backend/stock/multi.py:17",
+    "backend/stock/multi.py:64",
+    "backend/pipeline/remotion_render.py:15"
+   ],
+   "recommendation": "Переносить не merge всей ветки v5, а cherry-pick точечно: 4 .py-модуля + remotion/ + правки orchestrator/clips/models.yaml. Это режет поверхность изменений с ~12500 строк до ~2500 и убирает мёртвый груз."
+  },
+  {
+   "title": "scene_tagger.py и vision_scorer.py тянут openai + load_dotenv и битые top-level импорты — НЕ переносить scene_tagger",
+   "severity": "MAJOR",
+   "detail": "scene_tagger.py делает `from openai import OpenAI` (пакет openai НЕ в requirements.txt integrate — будет ImportError при импорте модуля) и `load_dotenv`. Его внутренние импорты ссылаются на несуществующие top-level модули: `from scene_tagger import ...` (scene_tagger.py:13), `from clip_vision_scorer import ...` (transcript_input.py:132) — это легаси-пути из старого репозитория, в пакетной структуре backend.* они упадут. scene_tagger в основной пайплайн НЕ подключён (orchestrator использует clips.plan_scenes), поэтому это чистый landmine. vision_scorer.py тоже делает load_dotenv и requests.post напрямую (минуя backend/utils/llm.py — нарушение code-style 'LLM calls only through llm.py'), но requests в requirements есть, а нужная функция score_thumbnail самодостаточна.",
+   "files": [
+    "backend/pipeline/scene_tagger.py:13",
+    "backend/pipeline/scene_tagger.py:38",
+    "backend/pipeline/transcript_input.py:132",
+    "backend/pipeline/vision_scorer.py:20",
+    "backend/pipeline/vision_scorer.py:25"
+   ],
+   "recommendation": "НЕ переносить scene_tagger.py и transcript_input.py вообще. vision_scorer.py перенести, но проверить: VISION_MODEL берётся из OPENROUTER_VISION_MODEL (есть на Railway?), load_dotenv безвреден (на Railway .env нет, ключи в env). Опционально привести vision_scorer к вызову через backend/utils/llm.py позже, но для MVP оставить как есть — он деградирует gracefully (no_api_key → score 0.5)."
+  },
+  {
+   "title": "Dockerfile v5 разносит рабочий билд: chromium+node+npm install удваивают размер и время, теряют non-root и frontend в образе",
+   "severity": "CRITICAL",
+   "detail": "v5-Dockerfile добавляет stage 2 (remotion-bundle на node:20-bookworm с chromium+~15 libxxx) и в runtime ставит nodejs+npm+chromium+`npm install` в /app/remotion. Это: (1) +800МБ-1.2ГБ к образу и +неск. минут к билду (npm install Remotion 4.x при каждой пересборке без кеша); (2) теряет `USER appuser` (v5 runs as root — регресс безопасности, integrate явно делает useradd+chown+USER appuser); (3) теряет COPY --from=frontend-build dist (v5 копирует frontend/ целиком но не собранный dist — фронт может не работать); (4) `COPY data/ ./data/` тащит data целиком в образ (на integrate осознанно копируется только assets/house_music чтобы Railway-том /app/data не затенял музыку — v5 это ломает).",
+   "files": [
+    "Dockerfile",
+    "backend/pipeline/remotion_render.py:38"
+   ],
+   "recommendation": "НЕ заменять Dockerfile целиком. Взять integrate-Dockerfile и хирургически добавить: (а) в runtime apt-get добавить `nodejs npm chromium fonts-liberation libnss3` + ENV PUPPETEER_*; (б) добавить stage remotion-bundle ИЛИ просто COPY remotion/ + `npm install --prefix remotion`; (в) СОХРАНИТЬ COPY --from=frontend-build dist, USER appuser, и COPY data/house_music (не COPY data/ целиком). node_modules уже в .dockerignore — это корректно."
+  },
+  {
+   "title": "remotion_render использует `npx --yes remotion render` — пересборка бандла на КАЖДУЮ сцену (минуты × N инфографик)",
+   "severity": "MAJOR",
+   "detail": "remotion_render.render() запускает `npx --yes remotion render <comp> ...` с cwd=REMOTION_DIR (Dockerfile: /app/remotion). Без предварительного бандла Remotion бандлит React-проект заново на каждый вызов — а инфографик-сцен в видео может быть 5-15. При timeout=300с на вызов и холодном бандле это либо очень медленно, либо упирается в таймаут. Плюс под non-root appuser npx может не иметь прав писать в кеш Remotion (нужен HOME с правами). Также chromium в slim-runtime требует все libxxx (integrate их не ставит).",
+   "files": [
+    "backend/pipeline/remotion_render.py:38",
+    "backend/pipeline/remotion_render.py:53",
+    "backend/pipeline/clips.py:354"
+   ],
+   "recommendation": "В Dockerfile добавить шаг `npx remotion bundle` один раз при сборке образа и рендерить из готового бандла (serve-url), либо хотя бы прогреть npx-кеш. Убедиться что appuser владеет /app/remotion и есть писабельный HOME. Поднять/проверить timeout с учётом числа сцен. Для MVP можно оставить on-the-fly, но заложить риск медленного рендера в оценку."
+  },
+  {
+   "title": "requirements.txt v5 откатывает пины, которые integrate чинил ради билда Railway",
+   "severity": "CRITICAL",
+   "detail": "v5 меняет pydantic==2.4.2 → pydantic>=2.0, aiofiles==23.2.1 → >=23.2.1, fastapi/uvicorn на >=. Последние 2 коммита integrate (4951442 'pydantic 2.0.0→2.4.2 конфликт с fastapi', b964205 'aiofiles 23.0.0 отозван с PyPI → 23.2.1') — это ровно фиксы падавшего билда. Принять requirements от v5 = с высокой вероятностью реанимировать сломанный билд (>=2.0 даст pydantic 1.x-несовместимость или непроверенную мажорную версию). При этом v5-requirements НЕ добавляет ни одной питон-зависимости для Remotion/визуала (всё на npm-стороне) — единственное полезное добавление это pillow>=10.0.0 и edge-tts (уже есть).",
+   "files": [
+    "requirements.txt"
+   ],
+   "recommendation": "НЕ брать requirements.txt от v5. Оставить пины integrate. Если визуальному стеку реально нужен pillow — добавить ОДНУ строку pillow==10.x (с пином), проверив что image_gen/apply_ken_burns его использует. Остальное не трогать."
+  },
+  {
+   "title": "v5 orchestrator меняет дефолты VideoTask и теряет управление output_mode из API",
+   "severity": "MAJOR",
+   "detail": "v5 ставит output_mode default 'fcpxml' и добавляет cinematic_preset/music_track/source_transcripts в VideoTask. Но from_dict всё ещё читает output_mode default 'rendered' (orchestrator.py:101) — рассинхрон дефолтов. Хуже: api/main.py в v5 УДАЛЯЕТ `output_mode=req.output_mode` из конструирования задачи в _run_pipeline и create_video — то есть API больше не может задать output_mode, он жёстко падает в дефолт dataclass. И _phase_assembly при output_mode='rendered' делает `from backend.pipeline.assembly import assemble_video`, но assembly.py в v5 УДАЛЁН (216 стр) → ImportError если кто-то выберет rendered. cinematic_preset — мёртвое поле, нигде в пайплайне не применяется (grep по backend/pipeline даёт только объявление).",
+   "files": [
+    "backend/pipeline/orchestrator.py:36",
+    "backend/pipeline/orchestrator.py:101",
+    "backend/pipeline/orchestrator.py:301",
+    "backend/api/main.py:135"
+   ],
+   "recommendation": "При переносе НЕ тащить эти правки orchestrator/api вслепую. Решить осознанно: либо сохранить output_mode-управление из API (integrate-вариант лучше) + оставить assembly.py для режима rendered; либо если переходим только на fcpxml — удалить ветку assemble_video чтобы не было битого импорта. cinematic_preset либо реально подключить (вызов cinematic_preprocess в assembly/fcpxml), либо не добавлять поле."
+  },
+  {
+   "title": "v5 orchestrator РЕГРЕССИРУЕТ фикс house_music (Railway volume shadowing) — НЕ переносить _phase_music",
+   "severity": "CRITICAL",
+   "detail": "Коммит integrate 722df0e перенёс house_music в assets/ (вне тома /app/data) потому что персистентный том Railway затеняет запечённое в образе по пути /app/data. integrate _phase_music ищет [PROJECT_ROOT/assets/house_music, DATA_DIR/house_music]. v5 _phase_music откатывает это обратно на `Path(__file__).parent.parent / 'data' / 'house_music'` — то есть на проде музыки снова НЕ будет (том затенит). Это прямой регресс рабочего фикса.",
+   "files": [
+    "backend/pipeline/orchestrator.py:265",
+    "backend/pipeline/orchestrator.py:269"
+   ],
+   "recommendation": "НЕ переносить v5-версию _phase_music и удаление импорта DATA_DIR/PROJECT_ROOT. Сохранить integrate-логику с assets/house_music и кандидатами-фолбэками. Из orchestrator-diff взять ТОЛЬКО: смену script→script_gen, script→script_improver, source_transcripts проброс, и снятие raise при пустом clip_map (если решено делать видео без части клипов)."
+  },
+  {
+   "title": "scene_tagging переключён на экспериментальную модель x-ai/grok-build-0.1 + max_tokens 24000",
+   "severity": "MAJOR",
+   "detail": "models.yaml v5 меняет scene_tagging primary с google/gemini-2.5-flash на x-ai/grok-build-0.1 (комментарий: 'EXPERIMENT 2026-06-05, если JSON-валидность хуже Gemini — откатить'), fallback на gemini-2.5-flash, max_tokens 8000→24000. Это критично для intent-first: plan_scenes требует строгий JSON с on_screen/medium/remotion_data на 50-60 сцен; невалидный JSON ломает весь визуальный план. grok-build-0.1 — непроверенная на проде модель. 24000 токенов оправданы (8000 обрезало JSON), но смена primary рискованна.",
+   "files": [
+    "backend/config/models.yaml:34",
+    "backend/config/models.yaml:41"
+   ],
+   "recommendation": "Взять max_tokens: 24000 (нужно), но primary оставить gemini-2.5-flash (проверенная JSON-валидность), grok вынести в fallback или вообще не брать. После деплоя сравнить долю parse-error на реальных прогонах прежде чем менять primary."
+  },
+  {
+   "title": "visual_router и stock/multi нарушают code-style (urllib sync, bare except, raw strings) — приемлемо для MVP, отметить техдолг",
+   "severity": "MINOR",
+   "detail": "visual_router.py весь на urllib.request синхронно с `except:` без типа (search_pexels_photo, search_pixabay_video, search_wikipedia_image, search_archive_org), raw-строки URL — нарушает .claude/rules/code-style.md (async для внешних API, pathlib, без silent swallow). stock/multi.py оборачивает их в asyncio.to_thread (ок) и тоже глотает Exception. Это не блокер (модуль самодостаточен, деградирует gracefully), но search_archive_org строит download URL эвристикой `{ident}.mp4` — часто будет 404 (archive-org почти всегда даст битую ссылку).",
+   "files": [
+    "backend/visual_router.py:60",
+    "backend/visual_router.py:88",
+    "backend/visual_router.py:113",
+    "backend/stock/multi.py:31"
+   ],
+   "recommendation": "Перенести как есть для MVP. В беклог: заменить bare except на `except Exception as e: logger.debug(...)`, не использовать archive_org video-URL (эвристика битая) либо валидировать HEAD-запросом. score_thumbnail вызывается на каждый thumbnail синхронно внутри to_thread — на 50 сценах × 10 кандидатов это много vision-вызовов, заложить стоимость/время."
+  },
+  {
+   "title": "Пошаговый план интеграции с оценкой усилий и рисков",
+   "severity": "IMPROVEMENT",
+   "detail": "Связность стека: clips.py(новый)→{visual_router, vision_scorer.score_thumbnail, remotion_render→remotion/, stock/multi, image_gen.apply_ken_burns+generate_clip_fallback (на integrate обе функции ЕСТЬ — проверено image_gen.py:101,165)}. fcpxml_export идентичен на обеих ветках. requests уже в requirements. node_modules в .dockerignore.",
+   "files": [
+    "Dockerfile",
+    "backend/pipeline/clips.py",
+    "backend/visual_router.py",
+    "remotion/src/Root.tsx:13"
+   ],
+   "recommendation": "ШАГ 1 (низкий риск, ~30мин): cherry-pick файлов visual_router.py, vision_scorer.py (без scene_tagger/transcript_input), remotion/* целиком, stock/multi.py. Проверка: python -c импорт каждого модуля без ошибок локально. ШАГ 2 (средний, ~1ч): перенести clips.py из v5; точечно править orchestrator только script_gen/script_improver/source_transcripts, СОХРАНИВ integrate _phase_music и output_mode-управление. Проверка: импорт orchestrator + dry-run plan_scenes на тестовом скрипте даёт валидный JSON. ШАГ 3 (высокий, ~1-2ч): Dockerfile — добавить в integrate-Dockerfile node+chromium+libs+npm install remotion + ENV PUPPETEER_*, СОХРАНИВ USER appuser, COPY frontend dist, COPY data/house_music. Добавить `npx remotion bundle` на этапе сборки. Проверка: docker build локально + один remotion render внутри контейнера. ШАГ 4 (низкий): models.yaml — взять max_tokens 24000, primary оставить gemini. requirements — НЕ трогать пины, опц. +pillow. ШАГ 5: задеплоить на Railway, прогнать 1 короткое видео, проверить наличие музыки (регресс-тест house_music) и рендер инфографики. Общая оценка: 4-6 часов чистой работы. Главные риски: размер/время Docker-билда (CRITICAL), производительность remotion render on-the-fly (MAJOR), JSON-валидность scene_tagging на новой модели (MAJOR)."
+  },
+  {
+   "title": "generate_metadata не использует fallback-модель — фаза падает при сбое primary",
+   "severity": "MAJOR",
+   "detail": "call_llm в generate_metadata вызывается без fallback_model (metadata.py:70-75), хотя models.yaml для metadata задаёт fallback: deepseek/deepseek-chat-v3-0324, а call_llm полностью поддерживает fallback (llm.py:22,38-39). Все остальные фазы (script.py:74,97; virality.py:50) передают fallback_model=model_config.get('fallback'). Если Gemini вернёт 400/429/timeout — метадата не сгенерируется, и сработает грубый JSON-fallback (titles=[topic[:70]], tags=[]), то есть видео уедет в PUBLISH.txt вообще без SEO-заголовков и тегов. Это прямой удар по discoverability.",
+   "recommendation": "Добавить fallback_model=model_config.get('fallback') в вызов call_llm в generate_metadata.",
+   "files": [
+    "backend/pipeline/metadata.py:70-75",
+    "backend/config/models.yaml:47-52",
+    "backend/pipeline/llm.py:22"
+   ]
+  },
+  {
+   "title": "niche передаётся в промпт как сырое английское слово 'finance' вместо немецких ключевиков канала",
+   "severity": "MAJOR",
+   "detail": "niche = channel['niche'] = 'finance' (metadata.py:29, channels.yaml:6) подставляется в начало промпта 'Create YouTube metadata for a finance documentary video' и в инструкцию по тегам (metadata.py:37,60). При этом в channels.yaml есть готовые niche_keywords на немецком ('Aufstieg und Fall', 'Wirtschaft', 'verborgene Systeme') и search_queries (реальные поисковые формулировки конкурентов) — они НЕ передаются в промпт метадаты. LLM генерирует теги без опоры на реальную нишевую лексику немецкого YouTube, что снижает попадание в head-термины и рекомендации. Слово 'finance' в англоязычном виде вообще не релевантно немецкому SEO.",
+   "recommendation": "Передавать в промпт channel.get('niche_keywords') и channel.get('search_queries') как seed-термины: 'Включи и расширь эти нишевые термины в теги: {niche_keywords}. Реальные поисковые запросы аудитории: {search_queries}'. Это привяжет теги к фактическому спросу.",
+   "files": [
+    "backend/pipeline/metadata.py:29,37,60",
+    "backend/config/channels.yaml:8-14,32-42"
+   ]
+  },
+  {
+   "title": "Нет валидации тегов под лимит YouTube 500 символов и дедупликации",
+   "severity": "MAJOR",
+   "detail": "Промпт просит 20 тегов (metadata.py:60), но нигде нет проверки суммарной длины. YouTube жёстко режет теги на 500 символах суммарно — если LLM выдаст 20 длинных long-tail фраз, часть тегов молча отбросится при вставке, причём пострадают именно последние (часто самые специфичные). Также нет дедупликации и нормализации (теги-дубликаты, теги с лишними символами проходят как есть в build_publish_text:132). В PUBLISH.txt выводится сырой ', '.join(tags) без контроля бюджета символов.",
+   "recommendation": "После парсинга обрезать список тегов по бюджету 500 символов (с учётом запятых), убрать дубликаты (case-insensitive) и пустые. В PUBLISH.txt показать счётчик: 'TAGS (N штук, M/500 символов)'.",
+   "files": [
+    "backend/pipeline/metadata.py:60",
+    "backend/pipeline/metadata.py:130-132"
+   ]
+  },
+  {
+   "title": "Thumbnail-промпты запрещают лица — это снижает CTR на YouTube",
+   "severity": "MAJOR",
+   "detail": "В промпте превью жёстко зашито 'dramatic but NO clickbait faces' (metadata.py:62) и в обоих fallback 'no faces' (metadata.py:92,105). Для YouTube это контрпродуктивно: эмоциональное человеческое лицо с выраженной эмоцией — один из сильнейших драйверов CTR, и это не равно кликбейту. Запрет лиц оставляет только абстрактные editorial-картинки, которые проигрывают по кликабельности. Текущая формулировка путает 'кликбейт' (преувеличенные шок-гримасы, ложные обещания) с 'наличием лица'.",
+   "recommendation": "Заменить 'NO clickbait faces' на 'a single expressive human face/silhouette is allowed and encouraged for emotional CTR, but no exaggerated shock-grimaces or misleading visuals'. Добавить требования к читаемости overlay-текста на мобильном (крупный, высокий контраст) и к фокусной точке (one focal subject, rule of thirds).",
+   "files": [
+    "backend/pipeline/metadata.py:62,92,105"
+   ]
+  },
+  {
+   "title": "Паттерны заголовков задают шаблоны 'Warum...?' / 'Die Wahrheit über...' — риск однообразия и слабого curiosity gap",
+   "severity": "MINOR",
+   "detail": "Три формата заголовков жёстко предписаны (Question / Reveal / Number-shock, metadata.py:44-48). 'Die Wahrheit über...' — типичный AI/SEO-штамп, который уже примелькался и на немецком YouTube читается как генеренный контент; 'Warum...?'-вопросы часто дают слабый CTR без конкретики. Нет требования включать конкретное число/имя/сумму/срок (specificity) и нет запрета на overpromise. Ниша канала — Aufstieg und Fall конкретных компаний, где работают конкретные сущности (Wirecard, имена, суммы), а шаблоны этого не требуют.",
+   "recommendation": "Переписать инструкции: требовать в каждом заголовке конкретику (число/сумму/имя/срок) и curiosity gap без overpromise; убрать штамп 'Die Wahrheit über' в пользу формата 'Wie [Subjekt] [konkretes Ereignis]' и 'Der [Betrag/Zahl]-[Ereignis], den niemand kommen sah'. Добавить запрет на CAPS-LOCK и обязательное ключевое слово в первых 40 символах (мобильная обрезка).",
+   "files": [
+    "backend/pipeline/metadata.py:44-48"
+   ]
+  },
+  {
+   "title": "Лимит заголовка 70 символов мягкий, не проверяется; нет контроля видимости в мобильной выдаче (~50-60 симв.)",
+   "severity": "MINOR",
+   "detail": "Промпт говорит 'max 70 chars' (metadata.py:48), но это не валидируется после генерации, и fallback берёт topic[:70] (metadata.py:86,99). На YouTube мобильная и боковая колонка рекомендаций обрезают заголовок раньше 70 — критичны первые ~50-60 символов. Сейчас нет ни проверки длины, ни требования держать ключевую интригу/ключевик в начале. Длинный заголовок теряет хвост именно там, где находится разгадка curiosity gap.",
+   "recommendation": "Валидировать длину каждого заголовка после парсинга (лог-warning если >70), в промпте усилить: 'самое важное (число/имя/интрига) — в первых 50 символах, т.к. в рекомендациях остальное обрезается'.",
+   "files": [
+    "backend/pipeline/metadata.py:48,86,99"
+   ]
+  },
+  {
+   "title": "Язык 'en' существует как канал, но не имеет метки в lang_labels — английская метадата генерится через дефолтный fallback",
+   "severity": "MINOR",
+   "detail": "lang_labels содержит только 'de' и 'es' (metadata.py:31-34), при этом channels.yaml определяет полноценный 'en'-канал (channels.yaml:44-76). Для lang='en' сработает .get(lang, ('English', 'English-speaking')) — то есть дефолт случайно совпадает и работает, но это хрупко: любой будущий язык молча получит английскую метадату без предупреждения. Title-форматы в промпте захардкожены только для DE/ES примеров ('Warum...?'/'¿Por qué...?'), для EN примеров нет.",
+   "recommendation": "Добавить 'en': ('English', 'English-speaking') в lang_labels явно и логировать warning при неизвестном lang, чтобы не публиковать метадату не на том языке молча.",
+   "files": [
+    "backend/pipeline/metadata.py:31-35",
+    "backend/config/channels.yaml:44-76"
+   ]
+  },
+  {
+   "title": "Хрупкий парсинг code-fence: ломается на ```json и на трейлинг-тексте вокруг JSON",
+   "severity": "MINOR",
+   "detail": "Стрип markdown работает только если ответ начинается с ``` (metadata.py:78-79): split('\\n',1)[1].rsplit('```',1)[0]. Если модель вернёт пояснительный текст перед/после JSON-блока, или вложенные ```-блоки, json.loads упадёт и сработает деградированный fallback с пустыми тегами (metadata.py:85-95). Для metadata это особенно дорого — теряются ВСЕ теги и нормальные заголовки. Учитывая, что fallback-модель к тому же не подключена (см. отдельный пункт), один кривой ответ = видео без SEO.",
+   "recommendation": "Извлекать JSON надёжно: найти первую '{' и последнюю '}' (или regex на сбалансированный объект) и парсить срез; при неудаче — повторный запрос с инструкцией 'ONLY JSON'. Минимум: использовать response.partition('```')[2] вместо split-по-первому-переносу.",
+   "files": [
+    "backend/pipeline/metadata.py:77-95"
+   ]
+  },
+  {
+   "title": "Hashtag-fallback в PUBLISH.txt делает невалидные хэштеги (убирает только пробелы)",
+   "severity": "MINOR",
+   "detail": "Когда в описании нет #-хэштегов, fallback берёт первые 5 тегов: '#' + t.replace(' ','') (metadata.py:138). Это удаляет только пробелы, но не другие символы, недопустимые в хэштегах YouTube (дефисы, точки, &, кавычки, диакритику в составных). Тег вида 'Aufstieg & Fall' превратится в '#Aufstieg&Fall' — невалидный хэштег. Кроме того, YouTube показывает над заголовком только первые 3 хэштега и игнорирует/банит при >15 — 5 без приоритизации субоптимально.",
+   "recommendation": "Нормализовать хэштеги: оставить только буквы/цифры (с поддержкой немецких умляутов), убрать спецсимволы; ограничить fallback 3 наиболее релевантными head-тегами, т.к. YouTube выводит над заголовком ровно 3.",
+   "files": [
+    "backend/pipeline/metadata.py:136-140"
+   ]
+  },
+  {
+   "title": "Промпт описания не задаёт реальную SEO-структуру: первые 2-3 строки, плотность ключевиков, CTA, ссылки",
+   "severity": "IMPROVEMENT",
+   "detail": "Инструкция описания общая: 'First line: strong hook', '2-3 paragraphs', 'Timestamps placeholder', 'hashtags' (metadata.py:52-57). Не учтено главное для немецкого YouTube-SEO: критичны именно первые ~150 символов (видны в поиске и над 'mehr anzeigen'), нужна естественная плотность ключевиков из niche_keywords в первом абзаце, нет блоков 'Kapitel'/timestamps в формате 0:00, нет места под disclaimer/источники (важно для finance-документалок и доверия YouTube), нет CTA-блока. 'Timestamps placeholder' выдаёт буквальный плейсхолдер, который автор должен заполнять руками — а структуру глав можно сгенерировать.",
+   "recommendation": "Расширить промпт: явно требовать первые 150 символов как self-contained SEO-hook с главным ключевиком; первый абзац — с 2-3 niche_keywords естественно; блок Kapitel с реальными таймкодами-заготовками (0:00 Intro и т.д.); отдельный блок 'Quellen/Disclaimer'; короткий CTA без forbidden_phrases из channels.yaml. Передавать niche_keywords в промпт описания.",
+   "files": [
+    "backend/pipeline/metadata.py:52-57",
+    "backend/config/channels.yaml:8-14,26-30"
+   ]
+  },
+  {
+   "title": "В PUBLISH.txt нет проверки/подсветки длины заголовков и нет рекомендованного выбора по умолчанию",
+   "severity": "IMPROVEMENT",
+   "detail": "build_publish_text выводит варианты заголовков без счётчика символов и без пометки 'рекомендую N' (metadata.py:118-121). Автор копипастит вслепую, не видя какой влезет в мобильную обрезку и какой соответствует 70-символьному лимиту. Это снижает практическую ценность для CTR — лучший по формулировке вариант может оказаться обрезанным в выдаче.",
+   "recommendation": "Рядом с каждым заголовком выводить (NN симв.) и помечать те, что >60 символов как 'обрежется на мобильном'. Опционально — попросить LLM вернуть поле recommended_title_index и подсветить его в PUBLISH.txt.",
+   "files": [
+    "backend/pipeline/metadata.py:118-121"
+   ]
+  },
+  {
+   "title": "Жёстко '20 tags' без явного баланса head/long-tail в выводе и без brand/entity-тегов",
+   "severity": "IMPROVEMENT",
+   "detail": "Промпт просит микс head+long-tail+hype (metadata.py:60), но не структурирует результат, поэтому невозможно проверить баланс, и нет требования включать entity-теги (имя компании/персоны из сценария — самый сильный сигнал релевантности для конкретной Aufstieg-und-Fall-истории). Теги выводятся одной строкой без разбивки (metadata.py:131-132). Entity-теги (например реальное имя компании из topic/script) критичны, чтобы видео всплывало в поиске по самому событию.",
+   "recommendation": "В промпте явно потребовать: 3-5 head-тегов, 10-12 long-tail, 2-3 entity-тега (конкретные имена/бренды из сценария), 2-3 trending-тега ниши. Опционально вернуть их сгруппированно для контроля и для понятного вывода в PUBLISH.txt.",
+   "files": [
+    "backend/pipeline/metadata.py:60",
+    "backend/pipeline/metadata.py:131-132"
+   ]
+  },
+  {
+   "title": "Чанки TTS склеиваются через amix с накапливающимся adelay — голос накладывается сам на себя, а не идёт последовательно",
+   "severity": "CRITICAL",
+   "detail": "В _concatenate_audio чанки не конкатенируются, а МИКСУЮТСЯ. Для чанка i ставится adelay = i*pause*1000 мс (например 0, 400, 800 мс), затем всё это уходит в amix=inputs=N:duration=longest. adelay сдвигает старт чанка лишь на доли секунды относительно нуля, а не на конец предыдущего чанка. То есть чанк 0 (несколько минут речи), чанк 1 (сдвинут на 0.4с) и чанк 2 (сдвинут на 0.8с) играют ОДНОВРЕМЕННО поверх друг друга. Для одного чанка ветка copy работает (поэтому при коротких сценариях баг не виден), но любое видео >5000 символов (а целевая длина 20-25 мин ≈ 18-22k символов, то есть 4-5 чанков) даст кашу из наложенных голосов. Это самый серьёзный дефект в аудио-зоне.",
+   "recommendation": "Делать настоящую последовательную конкатенацию: либо ffmpeg concat demuxer (как в assembly._concat_video), либо filter_complex с concat=n=N:v=0:a=1 и вставкой между чанками отрезков тишины нужной длины (anullsrc / apad). Дополнительно — чтобы паузы между чанками не резали слово, лучше резать сценарий по абзацам/предложениям с явной точкой и добавлять паузу как тишину, а не как сдвиг. Покрыть тестом: синтез 3 чанков → суммарная длительность ≈ сумма длительностей чанков + 2*pause, а не max(длительностей).",
+   "files": [
+    "backend/pipeline/tts.py:322",
+    "backend/pipeline/tts.py:338",
+    "backend/pipeline/tts.py:346",
+    "backend/pipeline/tts.py:339"
+   ],
+   "recommendation_note": ""
+  },
+  {
+   "title": "Нет ducking музыки под голос — главное отличие любительского звука от документального",
+   "severity": "MAJOR",
+   "detail": "Ни в одном из двух путей вывода нет sidechain-компрессии (ducking). В assembly._mix_audio музыка просто опускается на фиксированный volume=0.12 и микшуется amix с голосом — статичный уровень. В FCPXML музыка кладётся одним adjust-volume -18.4 dB на всю дорожку. В топовых документалках музыка автоматически приседает на 6-12 dB, когда говорит диктор, и возвращается в паузах/проигрышах — это даёт и атмосферу, и идеальную разборчивость речи. Сейчас либо музыка глушит окончания фраз, либо (на 12%) почти не слышна в паузах, где как раз нужна атмосфера.",
+   "recommendation": "В rendered-пути заменить статичный amix на sidechaincompress: [music]sidechaincompress=threshold=0.05:ratio=8:attack=5:release=400 c голосом как ключом, потом amix голоса и приглушённой музыки. Базовый уровень музыки тогда можно поднять до ~18-22%, а под голосом она будет автоматически падать на ~10-12 dB. Для FCPXML-пути (полуавто, DaVinci) — добавить в motion-notes.md явную инструкцию навесить sidechain-ducking (Resolve Fairlight) и не полагаться на статичный -18.4 dB; либо отдавать музыку уже отдакенной по voiceover как отдельный готовый файл.",
+   "files": [
+    "backend/pipeline/assembly.py:176",
+    "backend/pipeline/fcpxml_export.py:253",
+    "backend/pipeline/fcpxml_export.py:40"
+   ]
+  },
+  {
+   "title": "Нет нормализации громкости голоса (loudnorm / EBU R128) — уровень плавает между видео и не соответствует стандарту YouTube",
+   "severity": "MAJOR",
+   "detail": "Голос нигде не приводится к целевому LUFS. fal/ElevenLabs и Edge TTS выдают разный уровень, чанки могут отличаться по громкости, итог микшуется amix с normalize=0. YouTube нормализует к ~-14 LUFS; документалки мастерятся в районе -14..-16 LUFS integrated с пиком ≤ -1 dBTP. Сейчас громкость финала случайна: одно видео тихое, другое перегруженное, у некоторых клиппинг при amix двух дорожек. Это слышно сразу как непрофессионализм.",
+   "recommendation": "Добавить финальный проход loudnorm: ffmpeg -af loudnorm=I=-14:TP=-1.5:LRA=11 (в идеале two-pass — сначала measured, потом применить с measured_I/TP/LRA для точности). Применять к итоговому миксу в assembly после amix; для FCPXML — нормализовать voiceover.mp3 до выдачи (например -16 LUFS, чтобы оставить хедрум под музыку и графику в DaVinci). Также включить normalize в amix или нормализацию голоса до микса, чтобы избежать клиппинга суммы.",
+   "files": [
+    "backend/pipeline/assembly.py:177",
+    "backend/pipeline/tts.py:84",
+    "backend/pipeline/tts.py:352"
+   ]
+  },
+  {
+   "title": "Настройки голоса fal/ElevenLabs v3: передаётся только stability, отброшены similarity_boost/style/speed; значения подобраны под старую модель",
+   "severity": "MAJOR",
+   "detail": "_synthesize_chunk_fal формирует payload только из text, voice, stability и language_code (tts.py:162-167). similarity_boost: 0.80, style и speed из voices.yaml на fal-путь НЕ передаются вообще — то есть speed: 0.90 для DE и style игнорируются, голос идёт на дефолтах fal (speed=1, без управления стилем). Кроме того у ElevenLabs v3 stability концептуально это режимы Creative(~0.0-0.3)/Natural(~0.5)/Robust(~1.0): значения 0.50-0.55 = Natural, разумно для документалки (стабильно + выразительно), но это надо знать осознанно, а не как наследие v2. Не используются полезные для документалки use_speaker_boost, apply_text_normalization='on' (важно для чисел/дат/аббревиатур), и previous_text/next_text для бесшовности просодии между чанками.",
+   "recommendation": "В _synthesize_chunk_fal пробрасывать весь блок settings: similarity_boost, style, speed (диапазон fal 0.7-1.2), use_speaker_boost. Добавить apply_text_normalization='on' для DE/ES (числа, валюты, даты звучат корректнее). Для непрерывности между чанками передавать previous_text = хвост предыдущего чанка и next_text = начало следующего — это критично убирает скачки тона/темпа на стыках. Для документального тона зафиксировать Natural (stability ~0.5) осознанно и протестировать 0.4 vs 0.5 vs 0.6 на реальном тексте.",
+   "files": [
+    "backend/pipeline/tts.py:162",
+    "backend/pipeline/tts.py:163",
+    "backend/config/voices.yaml:10",
+    "backend/config/voices.yaml:38"
+   ]
+  },
+  {
+   "title": "Голос в моно, музыка в стерео — несогласованность и потеря пространства",
+   "severity": "MINOR",
+   "detail": "Финал TTS принудительно сводится в моно: _concatenate_audio пишет -ac 1 (tts.py:351). При этом музыка собирается в стерео 44100 (build_music_bed, aformat=channel_layouts=stereo), а FCPXML-ассеты объявлены audioChannels=2 (fcpxml_export.py:111). Голос в центре моно — это нормальная практика, но когда амикс делает стерео из моно-голоса и стерео-музыки, голос остаётся узким, а итоговое поле несогласовано по sample rate (TTS 44100, FCPXML декларирует 48000/audioRate=48000, музыка 44100). Несоответствие частот дискретизации между ассетами и sequence audioRate=48k ведёт к ресемплу в DaVinci.",
+   "recommendation": "Привести всё к единому стандарту: 48000 Hz везде (TTS-выход тоже 48k, чтобы совпадал с FCPXML SAMPLE_RATE и музыкой). Голос можно оставить моно на входе, но финальный мастер делать стерео с голосом по центру и музыкой в стерео-поле. В build_music_bed уже 44100 — поднять до 48000 для согласования с fcpxml_export.SAMPLE_RATE.",
+   "files": [
+    "backend/pipeline/tts.py:351",
+    "backend/pipeline/tts.py:352",
+    "backend/pipeline/music_select.py:733",
+    "backend/pipeline/fcpxml_export.py:39"
+   ]
+  },
+  {
+   "title": "Fade музыки в assembly реализован костылём (areverse дважды) вместо afade out, нет fade-out по факту",
+   "severity": "MINOR",
+   "detail": "В _mix_audio музыкальный фильтр: volume, afade in 3s, areverse, afade in 3s, areverse — то есть делается fade-in с обоих концов через двойной разворот. Это рабочий хак для fade-out без знания длительности, но: (1) areverse требует буферизации всей дорожки в память — на 20-25 мин трека это десятки МБ и лишнее время; (2) при duration=first в amix музыка обрезается по голосу, и второй (развёрнутый) fade может попасть не на самый конец, если длительности микса и музыки расходятся. В build_music_bed (FCPXML-путь) fade сделан корректно через afade=t=out:st=...:d=3, так что это расхождение между двумя путями.",
+   "recommendation": "В _mix_audio заменить трюк с areverse на нормальный afade=t=out:st=(duration-3):d=3, вычислив duration голоса через ffprobe (он уже считается в пайплайне как voiceover_duration). Так же убирается двойная буферизация всей дорожки.",
+   "files": [
+    "backend/pipeline/assembly.py:176",
+    "backend/pipeline/music_select.py:732"
+   ]
+  },
+  {
+   "title": "preprocess_text ломает произношение аббревиатур, заменяя на точки (C.E.O. → диктовка по буквам с паузами)",
+   "severity": "MINOR",
+   "detail": "preprocess_text меняет CEO→C.E.O., USA→U.S.A. и т.д. Для ElevenLabs v3 с apply_text_normalization это контрпродуктивно: точки между буквами модель может прочитать как обрывистую диктовку с микропаузами или вовсе как сокращённые предложения, что звучит ненатурально. v3 сам нормализует текст лучше при apply_text_normalization='on'. Кроме того замены глобальные по строке: '%'→' Prozent' и т.п. применяются и внутри слов/URL, а немецкий блок не покрывает падежи (Milliarden всегда им. падеж).",
+   "recommendation": "Для fal/v3-пути минимизировать ручную пред-обработку аббревиатур и положиться на apply_text_normalization='on'. Если оставлять — заменять CEO на полное слово целевого языка (Vorstandsvorsitzender/director ejecutivo) или оставлять как есть, а не вставлять точки. Ручные замены оставить только для Edge TTS fallback, который нормализацию не умеет.",
+   "files": [
+    "backend/pipeline/tts.py:97",
+    "backend/pipeline/tts.py:104",
+    "backend/pipeline/tts.py:100"
+   ]
+  },
+  {
+   "title": "Музыка не подбирается под mood/тему — house-пул из 5 универсальных треков на любое видео",
+   "severity": "IMPROVEMENT",
+   "detail": "В активном пайплайне _phase_music использует build_music_bed по фиксированному house-пулу без привязки к теме (комментарий прямо это фиксирует: 'без привязки к mood/таймингам'). При этом в music_select.py есть богатый mood-маппинг (THEME_LOCAL_MUSIC, THEME_MUSIC_QUERIES) и get_local_music по теме — но он НЕ вызывается оркестратором, это фактически мёртвый путь. Топовые документалки меняют музыкальные темы под драматургию (hook → нарастание → развязка). Один и тот же бесшовный луп 20+ минут утомляет и читается как 'фабрика'.",
+   "recommendation": "Либо подключить mood-подбор (get_local_music/get_music_for_theme по task.topic/style) вместо/в дополнение к house-пулу, либо собирать music bed из нескольких mood-секций по таймкодам сцен (intro/tension/resolution). Минимум — расширить house-пул и варьировать секвенс по длинным сегментам, чтобы не было одинакового лупа всё видео. Если mood-путь решено не использовать — удалить мёртвый код get_local_music/THEME_* по правилу хирургических изменений.",
+   "files": [
+    "backend/pipeline/orchestrator.py:266",
+    "backend/pipeline/music_select.py:445",
+    "backend/pipeline/music_select.py:322"
+   ]
+  },
+  {
+   "title": "Глобальная пауза между чанками 0.4с не учитывает контекст — на стыке предложений мало, на стыке абзацев мало",
+   "severity": "IMPROVEMENT",
+   "detail": "pause_between_chunks=0.4 одинаков для всех стыков (voices.yaml). В документальном тоне дыхание/паузы — часть драматургии: после ключевой фразы нужна пауза 0.8-1.5с, между смысловыми блоками — длиннее. Сейчас (после фикса бага конкатенации) все стыки получат ровно 0.4с независимо от того, конец это абзаца или разрыв посреди мысли. Плюс паузы появляются только на границах ЧАНКОВ (каждые ~5000 символов), то есть внутри длинного чанка нет управляемых пауз вообще — ритм задаёт только модель.",
+   "recommendation": "Управлять паузами на уровне предложений/абзацев, а не чанков: при сборке вставлять тишину переменной длины (короткая после предложения, длиннее после абзаца, ещё длиннее перед ключевыми поворотами). Для v3 можно использовать аудио-теги/разметку пауз там, где поддерживается. Резать на чанки по абзацам, а не строго по 5000 символов, чтобы стык чанка совпадал со смысловой границей.",
+   "files": [
+    "backend/config/voices.yaml:17",
+    "backend/pipeline/tts.py:83",
+    "backend/pipeline/tts.py:131"
+   ]
+  },
+  {
+   "title": "Edge TTS fallback даёт резко другой характер голоса — нет согласованности бренда между видео",
+   "severity": "IMPROVEMENT",
+   "detail": "При падении fal и отсутствии Voicer пайплайн уходит на Edge TTS (de-DE-KatjaNeural и т.д.). Это бесплатно и спасает прогон, но Edge-голоса звучат заметно роботизированнее ElevenLabs v3 и без управления stability/style. Если часть видео канала выходит на ElevenLabs, а часть — на Edge (из-за временного сбоя fal), у канала плавает 'лицо голоса', что для faceless-документалки критично — голос это и есть бренд.",
+   "recommendation": "Не публиковать автоматически видео, озвученные fallback-провайдером: помечать в task/metadata, что использован Edge, и требовать ручного ре-рендера на основном голосе. Либо добавить ретраи fal с backoff перед уходом на Edge. Как минимум — логировать факт fallback заметно (сейчас это warning среди прочих) и отражать в QA-flags.md.",
+   "files": [
+    "backend/pipeline/tts.py:207",
+    "backend/pipeline/tts.py:196",
+    "backend/pipeline/tts.py:229"
+   ]
+  },
+  {
+   "title": "Темп нарезки сломан: 1 сток-клип на всю сцену (30-90с статики) вместо документального ритма 3-6с/шот",
+   "severity": "CRITICAL",
+   "detail": "В download_clips на каждую сцену скачивается РОВНО ОДИН клип (clips.py:122 clip_path = clip_{i}.mp4, цикл по queries с break на первом успехе clips.py:126-146). В assembly этот единственный клип растягивается/тримится на всю длину сцены: scene_duration = scene_end - scene_start (assembly.py:56), затем -t target_duration (assembly.py:131). Длина сцены берётся из реальной озвучки куска текста через align_scenes (align_scenes.py:144-145), а сцен LLM делает мало (plan_scenes не задаёт количество — clips.py:48-70). На 22-минутном видео это типично 15-40 сцен → средняя сцена 30-90 секунд. Документальный канал держит ритм 3-6с на шот; здесь зритель смотрит ОДИН и тот же 10-секундный сток, зацикленный/растянутый на минуту. Это самый заметный признак 'дёшево': мёртвый кадр, очевидный loop, монотонность → провал retention. Хуже того: если min_duration не дотягивает (max(5, scene_duration*0.6) на clips.py:129), а -t больше длины файла — FFmpeg обрежет на последнем кадре (фриз), т.к. loop не включён в _normalize_clip (assembly.py:124-135).",
+   "recommendation": "Ввести нарезку сцены на под-шоты: для сцены длиннее ~8с качать N разных клипов (по разным queries сцены) и склеивать встык по 4-6с каждый, чередуя. В plan_scenes задать в промпте целевую длину сцены 6-12с и лимит (например duration/8 сцен), чтобы LLM дробил текст мельче. В _normalize_clip добавить -stream_loop -1 (или filter loop) когда длина исходника < target_duration, чтобы не было фриз-кадра в конце.",
+   "files": [
+    "backend/pipeline/clips.py:122",
+    "backend/pipeline/clips.py:126",
+    "backend/pipeline/clips.py:129",
+    "backend/pipeline/assembly.py:56",
+    "backend/pipeline/assembly.py:124",
+    "backend/pipeline/align_scenes.py:144"
+   ]
+  },
+  {
+   "title": "Vision scoring заявлен в docstrings/конфиге/QA, но НЕ реализован — релевантность клипа тексту не проверяется вообще",
+   "severity": "CRITICAL",
+   "detail": "Docstrings обещают проверку релевантности: clips.py:7 ('Vision scoring — verify clip relevance to narration'), clips.py:100 ('scores clips for relevance'), multi.py:14 ('Vision scoring (optional)'). В models.yaml:54-57 объявлена модель vision_scoring и её стоимость (models.yaml:67). fcpxml_export.py читает c.get('relevance_score') и флагит сцены ниже порога (fcpxml_export.py:227, 232-239). Но в реальности НИ ОДНА функция не вычисляет relevance_score — clip_map в download_clips (clips.py:133-144) такого ключа не пишет, поэтому QA-флаги в FCPXML всегда пустые (rel is None → ветка не срабатывает, fcpxml_export.py:232). Фактический отбор: берётся ПЕРВЫЙ HD-результат поиска (multi.py:122-141, цикл for video с return на первом подходящем по длине). Никакой проверки, что 'wall street traders panic' действительно показывает трейдеров, а не сток-улыбку в офисе. Это вторая по значимости причина 'непрофессионально': клип не по теме под конкретной фразой.",
+   "recommendation": "Реализовать vision_scoring: после download качать 3-5 кандидатов, прогонять через Gemini Vision (модель уже в конфиге) с кадром-превью (ffmpeg -ss thumbnail) + scene_text, брать клип с лучшим скором и писать relevance_score в clip_map. Тогда заработают и QA-флаги в FCPXML. Минимум — убрать ложные обещания из docstrings, если реализация откладывается.",
+   "files": [
+    "backend/pipeline/clips.py:7",
+    "backend/pipeline/clips.py:100",
+    "backend/pipeline/clips.py:133",
+    "backend/stock/multi.py:14",
+    "backend/stock/multi.py:122",
+    "backend/config/models.yaml:54",
+    "backend/pipeline/fcpxml_export.py:227",
+    "backend/pipeline/fcpxml_export.py:232"
+   ]
+  },
+  {
+   "title": "Нет дедупликации клипов — один и тот же сток-ролик попадает в несколько сцен",
+   "severity": "MAJOR",
+   "detail": "Каждая сцена ищет независимо и берёт первый результат по query (multi.py:64-82, clips.py:126-146). Нет общего реестра уже использованных URL/video_id. Если две сцены имеют похожие queries ('stock market crash' и 'financial crisis'), Pexels вернёт один и тот же топовый ролик → один и тот же кадр повторяется в видео несколько раз. Плюс docstring обещает 'SQLite cache with 7-day TTL' (multi.py:12, clips.py:8) — кэша в коде НЕТ вообще, это мёртвое обещание. Fallback reuse усугубляет: при провале поиска копируется clip_map[i % len] (clips.py:177-180) — буквальный дубль произвольной предыдущей сцены, что зритель замечает мгновенно.",
+   "recommendation": "Завести set() использованных video URL/id на весь прогон download_clips, пропускать уже взятые в multi.search (передавать exclude). Для reuse-фолбэка брать не i % len, а Ken Burns по уникальному кадру или хотя бы клип с максимально далёким индексом + другой Ken Burns эффект, чтобы дубль не читался. Либо реализовать заявленный SQLite-кэш, либо убрать обещание из docstrings.",
+   "files": [
+    "backend/stock/multi.py:64",
+    "backend/stock/multi.py:122",
+    "backend/pipeline/clips.py:126",
+    "backend/pipeline/clips.py:177",
+    "backend/stock/multi.py:12"
+   ]
+  },
+  {
+   "title": "Нет инфографики/графиков под data-сцены (числа, проценты, динамика) — для finance-канала это критично",
+   "severity": "MAJOR",
+   "detail": "Канал DE — Finance/Business, Rise & Fall истории (CLAUDE.md), сценарии прямо про data-integrity и числа. Но визуальный пайплайн НЕ умеет генерировать инфографику: когда нарратор говорит 'выручка упала с €2 млрд до нуля за 3 месяца', система ищет абстрактный сток 'stock market crash graph' (пример прямо в промпте clips.py:63) или генерит FLUX-картинку 'growing chart'. Реальные числа из сценария на экран НЕ выводятся. У конкурентов-документалок (особенно finance) числа/таймлайны/сравнения подаются анимированной инфографикой — это и есть 'профессионально'. Сейчас под самые важные смысловые моменты идёт generic-сток или FLUX-абстракция, которая числа рисует с ошибками (см. отдельную находку про FLUX-текст).",
+   "recommendation": "Добавить ветку в plan_scenes: помечать сцены тегом 'data'/'chart', когда в тексте есть числа/проценты/даты-динамика. Для таких сцен генерировать инфографику программно (matplotlib/HTML→PNG или Remotion — папка remotion/ уже появилась в репо) с реальными числами из текста, вместо стока. Минимум — текстовые оверлеи с ключевой цифрой поверх стока (drawtext в assembly).",
+   "files": [
+    "backend/pipeline/clips.py:48",
+    "backend/pipeline/clips.py:63",
+    "backend/pipeline/image_gen.py:228"
+   ]
+  },
+  {
+   "title": "FLUX-фолбэк: schnell-модель + safety off → галлюцинации текста, лиц и чисел в кадре",
+   "severity": "MAJOR",
+   "detail": "Фолбэк-картинки генерятся через flux/schnell (image_gen.py:27, используется в generate_scene_image:75) — самая быстрая/дешёвая, но и самая склонная к артефактам модель (кривые руки/лица, нечитаемый псевдо-текст, неверные цифры на 'графиках'). enable_safety_checker=False (image_gen.py:70) пропускает любой брак. Промпт просит 'no text, no people faces' (image_gen.py:236), но schnell это правило соблюдает плохо — особенно на data-сценах, где модель сама дорисовывает фейковые числа/буквы, которые выглядят как явная AI-генерация. Для документалки про реальную компанию галлюцинированное лицо/логотип = и дёшево, и юридически рискованно. FAL_FLUX_PRO_URL объявлен (image_gen.py:28), но НЕ используется — мёртвый код, хотя pro/1.1 заметно чище.",
+   "recommendation": "Переключить data/важные фолбэк-сцены на flux-pro/v1.1 (уже есть URL) или добавить негатив-промпт против text/watermark/extra fingers. Включить safety checker или хотя бы пост-валидацию (vision-скор картинки против промпта). В промпт добавить жёсткое 'no charts with numbers, no readable text, no specific logos'. Для сцен с числами вообще не использовать FLUX — только инфографику (см. предыдущую находку).",
+   "files": [
+    "backend/pipeline/image_gen.py:27",
+    "backend/pipeline/image_gen.py:28",
+    "backend/pipeline/image_gen.py:70",
+    "backend/pipeline/image_gen.py:75",
+    "backend/pipeline/image_gen.py:236"
+   ]
+  },
+  {
+   "title": "Отбор стока по принципу 'первый HD-результат' игнорирует релевантность, ориентацию по факту и качество композиции",
+   "severity": "MAJOR",
+   "detail": "PexelsSource.search берёт первое видео в выдаче, у которого длина >= min_duration, и из него самый высокий по высоте файл (multi.py:122-139). Сортировки/ранжирования по релевантности к query нет — полагается на дефолтный порядок Pexels, который часто отдаёт generic-улыбки и обобщённый бизнес-сток. orientation=landscape передаётся в params (multi.py:104), но НЕ проверяется на реальном файле — портретные/квадратные ролики после pad дадут чёрные полосы (assembly.py:91-92). Pixabay вообще не фильтрует ориентацию (multi.py:175-180). per_page=10, но используется только первый подходящий — остальные 9 кандидатов не оцениваются. Для документалки это даёт набор разнородных stocky-роликов 'ни о чём'.",
+   "recommendation": "Качать топ-3-5 кандидатов и выбирать через vision-скор (см. находку про vision_scoring). Проверять фактический aspect ratio файла (width/height) и отбрасывать не-16:9 или обрабатывать crop вместо pad. Для Pixabay добавить фильтр ориентации/соотношения сторон по полям ответа.",
+   "files": [
+    "backend/stock/multi.py:101",
+    "backend/stock/multi.py:122",
+    "backend/stock/multi.py:175",
+    "backend/pipeline/assembly.py:91"
+   ]
+  },
+  {
+   "title": "Агрессивный 'disguise' стек фильтров (noise+vignette+crop+unsharp) удешевляет картинку вместо маскировки стока",
+   "severity": "MINOR",
+   "detail": "На КАЖДЫЙ клип безусловно накладывается: crop 92% + rescale (assembly.py:108-109), film grain noise alls=8 (assembly.py:111), vignette PI/5 (assembly.py:113), unsharp (assembly.py:115). Цель в комментарии — 'disguise stock footage origin' (assembly.py:106). На практике постоянный noise=8 на 1080p H.264 заметно шумит и раздувает битрейт, vignette на ВСЕХ кадрах + и так применённый documentary colorbalance/eq (assembly.py:99-100) даёт пересвеченную тёмную рамку, а crop+upscale 92%→100% мылит картинку, которую unsharp потом перешарпивает (ореолы). Сумма этих 'хитростей' читается зрителем именно как дешёвая обработка. Также double scale (decrease+pad на :91-92, затем ещё scale 1920 на :109) — лишний ресэмплинг.",
+   "recommendation": "Снизить noise до alls=3-4 или применять выборочно, ослабить vignette, и НЕ делать crop+upscale на всех клипах (только там где реально нужно убрать вотермарку). Убрать двойной scale. Лучше один лёгкий grade, чем 4 разрушающих фильтра поверх друг друга.",
+   "files": [
+    "backend/pipeline/assembly.py:106",
+    "backend/pipeline/assembly.py:108",
+    "backend/pipeline/assembly.py:111",
+    "backend/pipeline/assembly.py:113",
+    "backend/pipeline/assembly.py:115"
+   ]
+  },
+  {
+   "title": "Все переходы — жёсткие cut'ы с одинаковым 0.3с fade in/out, нет кроссфейдов/разнообразия",
+   "severity": "MINOR",
+   "detail": "Каждый клип получает fade in 0.3с и fade out 0.3с к чёрному (assembly.py:117-120), затем клипы просто склеиваются concat-демуксером (assembly.py:143-157). Это значит между каждой сценой кадр на мгновение уходит в ЧЁРНОЕ (fade-to-black между всеми сценами) — на 30+ сценах это рваный, мерцающий ритм, нетипичный для гладкой документалки. Нет кроссфейдов (xfade), нет вариативности длительности перехода под mood (поле mood в clip_map есть — clip.get('mood'), clips.py:143 — но в assembly не используется вообще).",
+   "recommendation": "Заменить per-clip fade-to-black на crossfade между соседними клипами (xfade filter) хотя бы для смежных сцен одного mood; fade-to-black оставить только на смене глав/настроения. Использовать поле mood для выбора типа/длины перехода.",
+   "files": [
+    "backend/pipeline/assembly.py:117",
+    "backend/pipeline/assembly.py:120",
+    "backend/pipeline/assembly.py:143",
+    "backend/pipeline/clips.py:143"
+   ]
+  },
+  {
+   "title": "Ken Burns фолбэк: фиксированные параметры зума без учёта реальных размеров изображения → дрожание/обрезка",
+   "severity": "MINOR",
+   "detail": "apply_ken_burns использует zoompan с хардкод-скоростью 0.0008 и d=total_frames (image_gen.py:129-140). Известная проблема ffmpeg zoompan: при больших d и s=1920x1080 на изображении, чей размер не кратен выходному, появляется субпиксельное дрожание (jitter) панорамы — particularly заметно на pan_left/pan_right где x зависит от on/total_frames (image_gen.py:135-138). Картинка от FLUX приходит как landscape_16_9 (image_gen.py:68), но фактический пиксель-размер не проверяется перед zoompan. Также effect выбирается random.choice (image_gen.py:122) без сидирования — два соседних FLUX-фолбэка могут получить одинаковый зум, усиливая ощущение шаблонности.",
+   "recommendation": "Перед zoompan апскейлить изображение (scale до ~4000px по ширине) чтобы убрать jitter, как рекомендует ffmpeg-сообщество. Чередовать effect детерминированно по индексу сцены, а не random. Согласовать длину зума с реальной длиной сцены (сейчас зум на всю длину — на 60с сцене это сверхмедленно и выглядит как статика).",
+   "files": [
+    "backend/pipeline/image_gen.py:122",
+    "backend/pipeline/image_gen.py:129",
+    "backend/pipeline/image_gen.py:135",
+    "backend/pipeline/image_gen.py:68"
+   ]
+  },
+  {
+   "title": "Минимальная валидация скачанного клипа: проверяется только размер >10КБ, не длительность/кодек/целостность",
+   "severity": "MINOR",
+   "detail": "search_and_download считает загрузку успешной, если файл существует и >10240 байт (multi.py:70). Нет ffprobe-проверки, что файл — валидное видео нужной длины и читаемого кодека. Битый/обрезанный download (оборванный по таймауту httpx, который грузит весь ответ в память resp.content — multi.py:148,207,256) пройдёт проверку размера, но упадёт позже в _normalize_clip (assembly.py:137-140), что повалит ВСЮ сборку (CalledProcessError пробрасывается). Также весь файл читается в RAM (write_bytes(resp.content)) — на больших HD-клипах это память-неэффективно и без проверки Content-Length.",
+   "recommendation": "После download прогонять ffprobe (длительность>0, есть video stream); при провале — следующий кандидат/источник. В assembly обернуть _normalize_clip в try и пропускать битый клип вместо падения всей сборки. Стримить загрузку в файл (client.stream) вместо resp.content в память.",
+   "files": [
+    "backend/stock/multi.py:70",
+    "backend/stock/multi.py:148",
+    "backend/pipeline/assembly.py:137"
+   ]
+  },
+  {
+   "title": "Coverr-источник почти наверняка нерабочий (неверный API-контракт) — тихо ничего не отдаёт",
+   "severity": "MINOR",
+   "detail": "CoverrSource бьёт в https://api.coverr.co/videos без API-ключа (multi.py:227-237), хотя Coverr API требует авторизацию. Ответ парсится как data.get('hits') или data.get('videos') и urls.mp4 (multi.py:239-249) — это спекулятивная форма. Любая ошибка глушится except: return None (multi.py:236). На практике это источник-пустышка, который всегда возвращает None, создавая ложное ощущение '4 источника' (docstring multi.py:4-8), а реально работают только Pexels+Pixabay. Wikimedia из docstring (multi.py:6) вообще не реализован как класс. Это сужает разнообразие визуала и повышает частоту FLUX/reuse-фолбэков.",
+   "recommendation": "Либо подключить Coverr корректно с ключом и проверенным контрактом, либо убрать его из self.sources (multi.py:42) и из docstring, чтобы не маскировать реальное число рабочих источников. Рассмотреть добавление Wikimedia Commons (бесплатный архив, хорош для исторических документалок) как реальный источник разнообразия.",
+   "files": [
+    "backend/stock/multi.py:4",
+    "backend/stock/multi.py:42",
+    "backend/stock/multi.py:225",
+    "backend/stock/multi.py:236"
+   ]
+  },
+  {
+   "title": "plan_scenes не задаёт число/длину сцен и temperature=0.7 → нестабильный, крупнозернистый план",
+   "severity": "IMPROVEMENT",
+   "detail": "Промпт plan_scenes (clips.py:48-70) просит разбить сценарий на сцены, но НЕ задаёт ни целевое число сцен, ни целевую длину одной сцены, ни верхнюю границу. При scene_tagging temperature=0.7 (models.yaml:37 — высоковато для структурной задачи) LLM выдаёт произвольное и обычно МАЛОЕ число крупных сцен → корень проблемы темпа (см. CRITICAL про нарезку). Также total_duration на этапе scene_planning — это estimate (orchestrator.py:219-220), реальные тайминги перезапишет alignment, но число сцен уже зафиксировано по неверной длине. Нет ограничения max_tokens достаточного на много сцен (8000, models.yaml:38 — на 22 мин с мелкой нарезкой может не хватить, JSON обрежется → parse error clips.py:86-88, падение фазы).",
+   "recommendation": "В промпт добавить явно: целевая длина сцены 8-12с, итого примерно total_duration/10 сцен, каждая сцена = 1-2 предложения. Снизить scene_tagging temperature до ~0.3. Проверять, что число сцен достаточно для темпа; при риске обрезки JSON — поднять max_tokens или просить компактный JSON.",
+   "files": [
+    "backend/pipeline/clips.py:48",
+    "backend/config/models.yaml:37",
+    "backend/config/models.yaml:38",
+    "backend/pipeline/orchestrator.py:219"
+   ]
+  },
+  {
+   "title": "FLUX-фолбэк не работает: queue.fal.run требует поллинг, а код читает images из POST-ответа",
+   "severity": "CRITICAL",
+   "detail": "generate_scene_image делает один POST на FAL_FLUX_URL='https://queue.fal.run/fal-ai/flux/schnell' и сразу читает data.get('images', []) (image_gen.py:75-85). Но queue.fal.run — это АСИНХРОННАЯ очередь: POST возвращает только {request_id, response_url, status_url, cancel_url, queue_position}, а не результат (подтверждено docs.fal.ai/model-endpoints/queue). Ключа 'images' в ответе нет никогда → images=[] → функция всегда возвращает None. Сравни с tts.py:287-319, где для fal-очереди реализован правильный поллинг status_url. Последствие: AI-фолбэк (Fallback 1 в clips.py:148-173) фактически мёртв. Когда сток не нашёл клип, для ПЕРВОЙ сцены (clip_map ещё пуст) не сработает и Fallback 2 (reuse) — сцена просто пропускается (clips.py:175-193 reuse только if clip_map). Это дырки в видео и/или рассинхрон с озвучкой. Дополнительно: даже если бы POST возвращал результат — schnell-эндпоинт берёт payload {image_size, num_images, enable_safety_checker}, но flux/schnell ожидает поле 'image_size' как enum и это ок, основная проблема именно в очереди.",
+   "recommendation": "Реализовать поллинг как в tts.py: после POST взять data['response_url'] (или status_url), опрашивать с заголовком Authorization: Key $FALAPI до status COMPLETED, затем GET response_url для получения images[0].url. Либо использовать синхронный эндпоинт fal.run вместо queue.fal.run (как сделано в tts.py:154 'https://fal.run/...'), тогда POST вернёт результат напрямую. FAL_FLUX_PRO_URL (image_gen.py:28) объявлен, но нигде не используется — мёртвый код.",
+   "files": [
+    "backend/pipeline/image_gen.py:27-28",
+    "backend/pipeline/image_gen.py:75-94",
+    "backend/pipeline/clips.py:148-173"
+   ]
+  },
+  {
+   "title": "Скачанные mp4 не валидируются: нет проверки content-type, размера и кодируемости",
+   "severity": "CRITICAL",
+   "detail": "Download-методы пишут resp.content в файл при status_code==200 без какой-либо проверки (multi.py:147-149 Pexels, 207-209 Pixabay, 256-258 Coverr). Проверка размера >10240 байт есть только в search_and_download (multi.py:70), но 10КБ — это ничтожно мало: HTML-страница ошибки, усечённый/битый mp4 или JSON-ответ легко проходят порог. content-type вообще не проверяется. Pexels CDN при 403/редиректе может вернуть HTML с кодом 200. Битый/неполный mp4 не упадёт здесь, а взорвётся позже в _normalize_clip (assembly.py:137-140) через subprocess.CalledProcessError, которая прервёт ВСЮ сборку видео (краш всего пайплайна), а не отдельной сцены. У httpx по умолчанию нет потоковой загрузки — весь файл в память (resp.content); 120с-таймаут на write ок, но крупные mp4 раздувают RAM.",
+   "recommendation": "После скачивания проверять resp.headers.get('content-type') содержит 'video'/'mp4'/'octet-stream', а не 'text/html'/'application/json'; проверять Content-Length против реального размера; поднять минимальный порог размера (например >100КБ для видео). Лучше — ffprobe скачанного файла (как _get_duration в assembly.py:207) для валидации, что это декодируемое видео нужной длины, и при провале возвращать False чтобы сработал следующий источник/фолбэк. В _normalize_clip обернуть нормализацию каждого клипа в try/except, чтобы битая сцена не валила всю сборку (assembly.py:48-59).",
+   "files": [
+    "backend/stock/multi.py:64-82",
+    "backend/stock/multi.py:143-150",
+    "backend/stock/multi.py:204-210",
+    "backend/stock/multi.py:253-259",
+    "backend/pipeline/assembly.py:48-62"
+   ]
+  },
+  {
+   "title": "Нет зацикливания коротких клипов — дырки/рассинхрон в кадре",
+   "severity": "MAJOR",
+   "detail": "Класс-докстринг clips.py:9 и assembly.py:87 обещают 'trim/loop to target duration', но _normalize_clip только обрезает (-t target_duration, assembly.py:127) и НИКОГДА не зацикливает. min_duration в поиске = max(5, scene_duration*0.6) (clips.py:129), то есть допускается клип короче сцены вплоть до 60% длины. Если сцена 12с, а найден клип 7с — нормализованный клип будет 7с (ffmpeg -t 12 на 7с источнике не растянет, выдаст 7с), а concat склеит по факту → итоговое видео короче озвучки, картинка кончится раньше слов. Деградирует ещё сильнее с FLUX-фолбэком, который мёртв (см. отдельную находку). Также: scene_duration берётся из scene_end-scene_start; phase_scenes (orchestrator.py:214-230) строит план ДО alignment, а download_clips вызывается уже после realign — но если realign упал в _fallback_proportional с total_duration<=0, тайминги могут быть нулевыми (align_scenes.py:177), тогда scene_duration<=0 и -t 0 даст пустой/битый клип.",
+   "recommendation": "В _normalize_clip добавить -stream_loop -1 перед -i для входа и оставить -t target_duration для обрезки, либо использовать loop-фильтр; так короткий клип растянется до нужной длины. Защитить от scene_duration<=0: фиксировать минимальную длину сцены (например max(target_duration, 3.0)) в assembly.py:56 и clips.py:118.",
+   "files": [
+    "backend/pipeline/assembly.py:86-135",
+    "backend/pipeline/clips.py:118-129",
+    "backend/pipeline/clips.py:9"
+   ]
+  },
+  {
+   "title": "Pexels rate-limit обрабатывается частично, Pixabay/Coverr — никак; общий per-host лимит не учтён",
+   "severity": "MAJOR",
+   "detail": "Pexels: при 429 спим 60с и возвращаем None (multi.py:111-114) — но это пропускает запрос целиком, а _last_request у источника живёт в экземпляре PexelsSource. MultiStockClient создаётся ЗАНОВО на каждый download_clips (clips.py:113), а внутри одного видео для каждой сцены перебирается несколько queries (clips.py:126) — _min_interval=1.5с (multi.py:94) соблюдается в пределах одного объекта, ок. Но Pixabay (multi.py:184 raise_for_status) при 429 кинет HTTPStatusError, которая поймается в search_and_download (multi.py:78) и просто пропустит источник — без cooldown, при следующей сцене снова 429. Pixabay реальный лимит ~100 req/min, а per_page=10 и до 5 queries на сцену при ~40-60 сценах = сотни запросов → быстро упрётся. Coverr вообще без rate-limit и api.coverr.co требует авторизацию (Bearer token), запрос без ключа (multi.py:230-237) почти всегда вернёт не-200 → CoverrSource всегда бесполезен, т.е. реальных источников только 2.",
+   "recommendation": "Добавить cooldown для Pixabay по аналогии с Pexels (поймать 429 до raise_for_status). Вынести MultiStockClient за пределы download_clips (создавать один раз на пайплайн), чтобы _last_request переживал между сценами. Для Coverr — либо добавить Authorization-заголовок с ключом, либо убрать источник как нерабочий (сейчас это иллюзия третьего фолбэка). Рассмотреть глобальный счётчик запросов в минуту на источник, а не только min_interval.",
+   "files": [
+    "backend/stock/multi.py:111-114",
+    "backend/stock/multi.py:182-185",
+    "backend/stock/multi.py:220-251",
+    "backend/pipeline/clips.py:113"
+   ]
+  },
+  {
+   "title": "apply_ken_burns вызывает синхронный subprocess.run в async-функции — блокирует event loop",
+   "severity": "MAJOR",
+   "detail": "generate_clip_fallback (async, image_gen.py:165) вызывает apply_ken_burns (image_gen.py:101) напрямую, а та делает subprocess.run(cmd) синхронно (image_gen.py:156) — FFmpeg-энкодинг изображения в видео блокирует весь event loop на секунды/десятки секунд. Сравни с assembly.py:58,66,69, где нормализация/конкат правильно завёрнуты в asyncio.to_thread. Если пайплайн обслуживает несколько задач (FastAPI background tasks по api-conventions.md) — одна Ken Burns заморозит все остальные корутины (поллинг TTS, другие загрузки). Нарушает .claude/rules/code-style.md ('async functions for anything that calls external APIs', subprocess тоже блокирующий).",
+   "recommendation": "Обернуть вызов apply_ken_burns в await asyncio.to_thread(...) внутри generate_clip_fallback (image_gen.py:202), как уже сделано в assembly.py. apply_ken_burns может остаться синхронной.",
+   "files": [
+    "backend/pipeline/image_gen.py:156",
+    "backend/pipeline/image_gen.py:201-206"
+   ]
+  },
+  {
+   "title": "Pexels orientation=landscape + size=large отсекает результаты, нет фолбэка на менее строгие параметры",
+   "severity": "MINOR",
+   "detail": "Pexels search жёстко задаёт size='large' и orientation='landscape' (multi.py:104-105). Для специфичных запросов (clips.py:62 требует специфичные '4-5 English queries', типа 'nokia factory workers 1990s') large+landscape часто даёт 0 результатов, тогда как portrait/small варианты есть. Дополнительно фильтр hd_files>=720 (multi.py:129) ещё сужает. Если все queries сцены вернут пусто — уходим в мёртвый FLUX-фолбэк → дырка. Пустой результат поиска тихо логируется в search_and_download только при исключении (multi.py:79), а нормальный None (ничего не нашли) не логируется вообще — сложно диагностировать почему сцена пустая.",
+   "recommendation": "Сделать size/orientation мягкими: при пустом результате повторить запрос без size/orientation. Логировать на уровне info, когда источник вернул 0 результатов по запросу (не только при исключении), чтобы видеть в логах причину пустых сцен.",
+   "files": [
+    "backend/stock/multi.py:101-141",
+    "backend/pipeline/clips.py:124-146"
+   ]
+  },
+  {
+   "title": "Docstring обещает SQLite-кэш (7d TTL) и vision scoring — реализации нет",
+   "severity": "MINOR",
+   "detail": "multi.py:11-14 и clips.py:6-9 документируют 'SQLite cache with 7-day TTL', 'Vision scoring — verify clip matches narration', 'Rate limiting per source'. По факту в multi.py нет ни импорта sqlite, ни кэша, ни vision-проверки (grep подтвердил: cache/sqlite встречается только в комментарии). Каждый прогон скачивает заново → лишние запросы к лимитированным API (усугубляет rate-limit находку) и нет проверки релевантности клипа тексту → визуал может не совпадать с озвучкой. Это вводящая в заблуждение документация + отсутствующая функциональность, заявленная в архитектуре проекта (CLAUDE.md).",
+   "recommendation": "Либо реализовать кэш по (source, query) с TTL чтобы экономить лимиты при повторных прогонах/чекпойнтах, либо убрать обещания из docstring чтобы не вводить в заблуждение. Vision scoring (CLIP/LLM-проверка кадра против scene_text) реально снизил бы число нерелевантных клипов.",
+   "files": [
+    "backend/stock/multi.py:10-15",
+    "backend/pipeline/clips.py:4-10"
+   ]
+  },
+  {
+   "title": "Reuse-фолбэк копирует клип с чужой scene_duration → обрезка/растяжение не под текущую сцену",
+   "severity": "MINOR",
+   "detail": "Fallback 2 (clips.py:176-193) при отсутствии клипа копирует файл предыдущей сцены через shutil.copy2 и в clip_map записывает duration переиспользуемой сцены (clip_map[reuse_idx]['duration'], clips.py:188), НО scene_start/scene_end ставит от ТЕКУЩЕЙ сцены (clips.py:189-190). В assembly scene_duration считается из scene_end-scene_start текущей сцены (assembly.py:56) — это ок по длине, но визуально один и тот же клип повторяется (reuse_idx = i % len(clip_map), clips.py:178 — для соседних сцен часто берётся один и тот же ранний клип). При большом числе пропусков видео станет заметно повторяющимся. Плюс reuse недоступен для первой пустой сцены (clip_map пуст) — она вообще выпадает из clip_map, и в assembly соответствующего клипа не будет → сдвиг всех последующих сцен относительно озвучки.",
+   "recommendation": "Гарантировать, что для КАЖДОЙ сцены в clip_map есть запись (даже первой): добавить терминальный фолбэк — генерация однотонного/градиентного фона нужной длины через ffmpeg lavfi color, чтобы не было пропусков и сдвига тайминга. Для reuse выбирать наиболее тематически близкий клип (по mood), а не i % len.",
+   "files": [
+    "backend/pipeline/clips.py:175-193"
+   ]
+  },
+  {
+   "title": "Жёсткие таймауты httpx без ретраев на сетевые сбои",
+   "severity": "IMPROVEMENT",
+   "detail": "Все загрузки используют разовый GET с фиксированным timeout (multi.py:145 timeout=120, image_gen.py:73 timeout=60) без ретраев. Одна сетевая ошибка/таймаут на крупном mp4 → источник пропускается (или для FLUX весь фолбэк None). На длинном видео в 40-60 сцен вероятность хотя бы одного транзиентного сбоя высока. Также download_clips перебирает источники последовательно и синхронно по сценам — для 40-60 сцен это десятки минут; можно параллелить с ограничением конкурентности.",
+   "recommendation": "Добавить 2-3 ретрая с экспоненциальным backoff на сетевые ошибки/5xx при скачивании. Рассмотреть ограниченную параллельность сцен (asyncio.Semaphore) для ускорения, не превышая rate-limit источников.",
+   "files": [
+    "backend/stock/multi.py:143-150",
+    "backend/pipeline/clips.py:116-146"
+   ]
+  },
+  {
+   "title": "FCPXML src-путь не XML-экранируется и не URL-кодируется → спецсимвол в пути ломает весь импорт в DaVinci",
+   "severity": "CRITICAL",
+   "detail": "В fcpxml_export.py src формируется через rel_src()/file_url(), которые делают ТОЛЬКО .replace(\" \", \"%20\") (строки 56, 69). XML-escape (escape()) применён к name/project/event (строки 98,108,127,268,269), но НЕ к самому src (строки 102, 112). Если в пути есть '&' — он попадает в XML-атрибут как сырой '&', и весь файл становится невалидным XML → DaVinci отвергает импорт целиком (а не одну сцену). Проверено: parser ломается на '&'; символы '%','#','?' дают невалидный/обрезанный URI. Путь user-controlled: topic → safe_topic в orchestrator.py:63 чистит только пробелы и '/', НЕ трогает '&','%','#','?','''. Тема вида \"AT&T Scandal\" → папка at&t_scandal_... → битый FCPXML.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:54-69",
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:102",
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:112",
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/orchestrator.py:63"
+   ],
+   "recommendation": "Кодировать src через urllib.parse.quote(str(path), safe='/') (даёт корректный percent-encoding для &,%,#,?,пробелов сразу), затем для абсолютного варианта префикс 'file://'. Дополнительно прогнать результат через xml.sax.saxutils.quoteattr или escape перед вставкой в атрибут. И/или ужесточить safe_topic в orchestrator.py:63 до [a-z0-9_]+ (re.sub)."
+  },
+  {
+   "title": "Дрейф таймлайна: offset клипов на spine не совпадает с суммой длительностей → 19 чёрных гэпов + 20 наложений (~0.63s)",
+   "severity": "MAJOR",
+   "detail": "В _build_video_spine offset вычисляется как sec_to_rational(cursor), где cursor — накопленный float (cursor += dur, строки 119-129), а duration каждого клипа округляется до кадра НЕЗАВИСИМО. Поэтому round(sum(float)) != sum(round(dur_i)). На реальном артефакте из massenflucht_v7_clean.zip: из 222 клипов 148 имеют рассинхрон offset-vs-cumulative, итог 19 гэпов и 20 наложений, суммарно ~0.633s. На spine клипы последовательны — несовпадение offset с реальным концом предыдущего клипа даёт либо чёрные кадры в гэпах, либо обрезку при наложении, и постепенно копит A/V-рассинхрон относительно голоса.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:116-130"
+   ],
+   "recommendation": "Не округлять cursor в секундах. Вести курсор в КАДРАХ: f_cursor=0; для каждого клипа frames=round(dur*FPS); offset=f'{f_cursor*FRAME}/{TB}s'; dur_r=f'{frames*FRAME}/{TB}s'; f_cursor+=frames. Тогда offset[N] == точная сумма округлённых длительностей предыдущих клипов, гэпы/наложения исчезают."
+  },
+  {
+   "title": "GDrive-аплоад читает весь zip (~480MB) в память → OOM-kill убивает пайплайн на последнем шаге",
+   "severity": "MAJOR",
+   "detail": "delivery.py:68 делает body += zip_path.read_bytes() — весь zip целиком в bytes, плюс конкатенация (вторая копия), плюс httpx буферизует тело (третья). Реальный zip из примера = 480MB → пик ~1-1.5GB RAM. На Railway с ограниченной памятью это OOM. try/except вокруг upload_zip_to_gdrive (delivery.py:170-174) НЕ спасает: OOM = SIGKILL, не ловится — умирает весь процесс после всей дорогой работы (скрипт, TTS, клипы). Multipart с буферизацией тела также неоптимален для больших файлов (рекомендован resumable upload).",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/delivery.py:60-80"
+   ],
+   "recommendation": "Перейти на resumable upload (uploadType=resumable): создать сессию, затем стримить файл чанками через httpx content=открытый файловый объект/генератор, не загружая целиком в RAM. Минимум — не делать body += read_bytes(), а передавать httpx content=zip_path.open('rb') (httpx умеет стримить file-like)."
+  },
+  {
+   "title": "При успешном GDrive-аплоаде zip удаляется → кнопка скачивания на сайте исчезает (download_url=None), GDrive-ссылка в API не отдаётся",
+   "severity": "MAJOR",
+   "detail": "deliver() удаляет локальный zip, если GDrive-аплоад успешен (delivery.py:184-188). В fcpxml-режиме final_*.mp4 не создаётся, поэтому в main.py:93 has_output = zip_candidate.exists() or final_*.mp4 → False → download_url=None (main.py:91-95), и сам /download вернёт 404 (main.py:374-382). При этом gdrive_link кладётся только в checkpoint['delivery'], но НЕ пробрасывается в VideoResponse (main.py:100-116 не содержит поля ссылки). Итог: если GDrive настроен и работает — на сайте нет ни zip, ни ссылки; пользователь зависит только от Telegram. Это противоречит интенту коммита d06be9c \"zip download from site\".",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/delivery.py:183-188",
+    "/home/client/projects/youtube-factory-v5/backend/api/main.py:91-95",
+    "/home/client/projects/youtube-factory-v5/backend/api/main.py:100-116"
+   ],
+   "recommendation": "Либо не удалять zip (оставлять для /download как single source of truth), либо: если zip удалён, отдавать gdrive_link из checkpoint['delivery'] как download_url (редирект на GDrive в /download) и пробросить ссылку в VideoResponse. Минимально безопасно — убрать unlink (delivery.py:184-188)."
+  },
+  {
+   "title": "QA-флаги по relevance никогда не срабатывают — clip_map не содержит relevance_score",
+   "severity": "MINOR",
+   "detail": "fcpxml_export флагует клипы при relevance_score < 0.55 (строки 232-238) и в notify считает QA-флаги (delivery.py build_notification). Но download_clips (clips.py) кладёт в clip_map ключи scene_index/path/query/scene_text/source/duration/scene_start/scene_end/mood — БЕЗ relevance_score (clips.py:133-192). Значит c.get('relevance_score') всегда None → ветка LOW RELEVANCE мёртвая, единственный реальный флаг — FILE MISSING. Сергей думает что QA-проверка релевантности работает, а она нет.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/clips.py:133-192",
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:227-238"
+   ],
+   "recommendation": "Либо начать класть relevance_score в clip_map (из классификатора/скоринга клипа), либо честно убрать ветку relevance и не обещать QA по релевантности. Сейчас порог QA_RELEVANCE_THRESHOLD=0.55 — фикция."
+  },
+  {
+   "title": "Spine-длительность клипа может превысить длину исходного медиа → Media Offline/фриз в хвосте сцены",
+   "severity": "MINOR",
+   "detail": "Asset duration = ffprobe_duration(cp) or scene_dur (fcpxml_export.py:220), а длительность клипа на spine = scene_dur (строка 224, из scene_end-scene_start). Если запланированная сцена длиннее реального файла (короткий сток), DaVinci читает за концом ассета → чёрный кадр/фриз/Media Offline в конце сцены. В конкретном артефакте не сработало (0 из 222), но защиты нет — это латентный риск, зависящий от длины стока vs тайминга сцены.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:216-224"
+   ],
+   "recommendation": "Клампить длительность на spine: scene_dur = min(scene_dur, real_media_dur). Если сцена длиннее медиа — либо луп, либо растягивание скоростью, либо явный QA-флаг 'SHORT CLIP'."
+  },
+  {
+   "title": "assemble_video не защищает от scene_duration <= 0 → ffmpeg -t 0 ломает нормализацию/concat (rendered-режим)",
+   "severity": "MINOR",
+   "detail": "В assembly.py:56 scene_duration = scene_end - scene_start без проверки. Если тайминги равны/инвертированы (сбой alignment), target_duration<=0 уходит в _normalize_clip как '-t 0.0' (assembly.py:128) → пустой/невалидный клип, который затем валит concat. fcpxml_export такой случай обрабатывает (строка 217: if scene_dur<=0 → ffprobe), а assembly — нет. Зона rendered (autopilot), не основная, но тоже отдаёт артефакт.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/assembly.py:56",
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/assembly.py:119-120"
+   ],
+   "recommendation": "Добавить фолбэк как в fcpxml: if scene_duration <= 0: scene_duration = _get_duration(clip_path) (или дефолт ~5s). Пропускать/логировать клипы с нулевой длительностью."
+  },
+  {
+   "title": "Аудио-клипы на lane=-1/-2 висят прямо под <spine> без анкора к primary-клипу — нестандартно для FCPXML",
+   "severity": "MINOR",
+   "detail": "voice/music добавляются как <asset-clip lane=-1/-2 ...> сиблингами primary-клипов внутри <spine> (fcpxml_export.py:243-257, реальный вывод подтверждает). По спецификации connected (lane) клипы должны быть ВЛОЖЕНЫ в primary storyline clip (анкор), а не лежать свободно на уровне spine. DaVinci исторически толерантен и, судя по тому что импорт у пользователя проходит, кладёт их на отдельные дорожки — но это хрупко и может сломаться при апдейте Resolve или строгой валидации.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:243-257",
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:133-147"
+   ],
+   "recommendation": "Проверить импорт на текущей версии DaVinci (верификация). Для надёжности — анкорить voice/music внутрь первого primary asset-clip (offset=0s lane=-1/-2 как дети первого клипа) либо использовать gap-clip как держатель. Сейчас работает по факту, но без гарантий."
+  },
+  {
+   "title": "music на полную длину timeline, но если короче голоса — обрывается тишиной без петли",
+   "severity": "IMPROVEMENT",
+   "detail": "В fcpxml music ставится duration=min(music_dur, voice_dur) (строки 253-257), комментарий честно говорит 'если короче — повторится в DaVinci вручную'. Сейчас music_select.build_music_bed строит бед на полную длину голоса (orchestrator.py:275), так что обычно ок. Но если бед короче voice_dur — конец видео без музыки и без авто-петли; это перекладывается на ручную работу в DaVinci.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/pipeline/fcpxml_export.py:251-257"
+   ],
+   "recommendation": "Гарантировать в music_select что бед >= voice_dur (он уже строится на dur голоса) и/или при music_dur < voice_dur добавлять второй music asset-clip-петлю до конца. Минимум — флаг в motion-notes.md что музыка короче таймлайна."
+  },
+  {
+   "title": "Имя файла в Content-Disposition (/download) не справится с не-ASCII в topic",
+   "severity": "IMPROVEMENT",
+   "detail": "main.py:371 topic_safe = topic[:40].replace(' ','_').replace('/','_') — кириллица/умляуты остаются в filename FileResponse (main.py:376-377, 380-381). Не-ASCII в заголовке Content-Disposition без RFC5987-кодирования может дать кривое/обрезанное имя файла у клиента. Косметика, артефакт не портит.",
+   "files": [
+    "/home/client/projects/youtube-factory-v5/backend/api/main.py:371-381"
+   ],
+   "recommendation": "Транслитерировать/ASCII-фолбэк имя файла, либо использовать filename* (RFC5987, FileResponse поддерживает через заголовок) для UTF-8 имён."
+  }
+ ],
+ "verdict_real": 100,
+ "verdict_notreal": 7
+}

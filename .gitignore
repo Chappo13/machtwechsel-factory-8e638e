@@ -1,0 +1,40 @@
+# Environment
+.env
+*.pyc
+__pycache__/
+.venv/
+venv/
+
+# Data (large files)
+data/output/
+data/clip_cache/
+data/music/
+logs/
+
+# System
+.DS_Store
+*.swp
+*.swo
+
+# IDE
+.vscode/
+.idea/
+.cursor/
+remotion/node_modules/
+
+# Heavy audio assets — not needed in git backup
+data/house_music/
+data/music_library/
+
+# Secrets (never commit)
+.env.*
+!.env.example
+**/.env
+client_secret*.json
+token*.json
+*_token.json
+.gdrive_token.json
+*.pem
+*.key
+cookies*.txt
+cookies*.json

@@ -1,0 +1,13 @@
+# /etc/systemd/system/youtube-factory.timer
+# Запуск каждый день в 04:00 UTC
+[Unit]
+Description=YouTube Factory daily run
+Requires=youtube-factory.service
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+Persistent=true
+RandomizedDelaySec=600
+
+[Install]
+WantedBy=timers.target

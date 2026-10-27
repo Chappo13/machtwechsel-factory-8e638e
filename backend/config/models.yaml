@@ -1,0 +1,114 @@
+# LLM model routing per task
+# All via OpenRouter API
+# Optimized 2026-04-07: GPT-4o removed, ~$0.026/video
+
+models:
+  script_generation:
+    # Gonka qwen3-235b: сильное креативное письмо DE/ES, ~2800x дешевле.
+    # Fallback — OpenRouter DeepSeek (кросс-провайдер, если Gonka недоступна).
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.75
+    max_tokens: 32000
+
+  script_improvement:
+    # Gonka qwen3-235b для редактуры; fallback Kimi-K2 (тоже Gonka).
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.4
+    max_tokens: 32000
+
+  script_humanize:
+    # Финальный «очеловечивающий» проход: вычистить AI-штампы, выровнять ритм под TTS.
+    # Kimi-K2 — большой контекст (2M), другое семейство чем qwen-генератор → лучше ломает клише.
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.6
+    max_tokens: 32000
+
+  script_judge:
+    # Строгий умный судья качества сценария (рубрика 7 критериев → JSON).
+    # Qwen3-235b reasoning: честно оценивает, ловит AI-штампы/галлюцинации. Gonka-провайдер.
+    # temp 0.0 — МАКСИМАЛЬНАЯ воспроизводимость: один и тот же текст должен давать
+    # один и тот же балл (иначе «Улучшить» показывает скачки 82→66 на том же тексте).
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.0
+    max_tokens: 8000
+
+  script_hook_variants:
+    # Best-of-N для cold-open хука: генерим N вариантов одним вызовом (высокая temp
+    # для разброса), микро-судья (модель script_judge, temp 0) выбирает лучший.
+    # n<=1 — проход выключен (молчаливый фолбэк на секционный хук при любом сбое).
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.9
+    max_tokens: 6000
+    n: 4
+
+  virality_filter:
+    # Gonka qwen3-235b — анализ/переписка хука; fallback Gemini.
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.5
+    max_tokens: 16000
+
+  fact_check:
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.2
+    max_tokens: 4000
+
+  scene_tagging:
+    # Kimi-K2: огромный контекст (2M), держит 32k+ output JSON для scene plan без обрезки.
+    # Раньше был Gemini 2.5 Flash (OpenRouter). Оба Gonka-провайдер.
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.7
+    max_tokens: 32000
+
+  translation:
+    # Gonka qwen3-235b — сильный мультиязык; fallback DeepSeek.
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.5
+    max_tokens: 32000
+
+  metadata:
+    # Gonka qwen3-235b — SEO-структура; fallback Gemini.
+    primary: "moonshotai/Kimi-K2.6"
+    fallback: "moonshotai/Kimi-K2.6"
+    temperature: 0.8
+    max_tokens: 4000
+
+  vision_scoring:
+    primary: "moonshotai/Kimi-K2.6"
+    temperature: 0.3
+    max_tokens: 500
+
+# Cost estimates per video (20-25 min)
+# Based on OpenRouter pricing 2026-04
+cost_estimate:
+  script_generation: 0.004   # DeepSeek $0.15/$0.75
+  script_improvement: 0.016  # Gemini 2.5 Flash $0.30/$2.50
+  virality_filter: 0.002     # Gemini Flash
+  scene_tagging: 0.001       # Gemini 2.0 Flash $0.10/$0.40
+  metadata: 0.001            # Gemini 2.0 Flash
+  vision_scoring: 0.001      # Gemini 2.0 Flash
+  translation: 0.002         # DeepSeek (30% of videos)
+  total_per_video: 0.026     # was $0.18 — 7x cheaper
+
+# Генератор картинок для doodle/stick-figure сцен — swappable БЕЗ правки кода.
+# Flux Schnell ($0.003) дёшев, но мылит и каракулит абстракции. Seedream v4
+# ($0.03) — чистый мульт, ~$1.8-2 на 7-8-мин видео. Вернуться на Schnell или
+# перейти на Nano Banana — меняешь endpoint+params здесь, код не трогаешь.
+image_generation:
+  endpoint: "https://fal.run/fal-ai/bytedance/seedream/v4/text-to-image"  # СИНХРОННЫЙ (быстро ~5-8с), не queue
+  params:
+    image_size: "landscape_16_9"
+    num_images: 1
+    enable_safety_checker: false
+  # Альтернативы:
+  # Flux Schnell (старый, дешёвый): endpoint .../fal-ai/flux/schnell
+  #   params добавить num_inference_steps: 4
+  # Nano Banana 2 (дороже ~$0.08, качество выше): endpoint .../fal-ai/nano-banana-2

@@ -1,0 +1,121 @@
+# Retention hooks and forbidden patterns per language
+
+retention_hooks:
+  de:
+    allowed:
+      - pattern: "Aber hier wird es interessant"
+        max_occurrences: 2
+      - pattern: "Merke dir diese Zahl"
+        max_occurrences: 3
+      - pattern: "Darüber spricht niemand"
+        max_occurrences: 2
+      - pattern: "Was dann passierte"
+        max_occurrences: 2
+      - pattern: "Aber Moment"
+        max_occurrences: 2
+      - pattern: "Währenddessen"
+        max_occurrences: 3
+
+    forbidden:
+      - pattern: "Das wirst du nicht glauben"
+        reason: "Clickbait"
+      - pattern: "Hey Leute"
+        reason: "Weak hook"
+      - pattern: "Einige Experten sagen"
+        reason: "Vague sourcing"
+      - pattern: "Zusammenfassend"
+        reason: "AI-sounding"
+      - pattern: "Lass uns eintauchen"
+        reason: "Overused"
+      - pattern: "Erstens, Zweitens, Drittens"
+        reason: "Robotic numbered lists"
+
+  es:
+    allowed:
+      - pattern: "Pero aquí es donde se pone interesante"
+        max_occurrences: 2
+      - pattern: "Recuerda este número"
+        max_occurrences: 3
+      - pattern: "Nadie habla de esto"
+        max_occurrences: 2
+      - pattern: "Lo que pasó después"
+        max_occurrences: 2
+      - pattern: "Pero espera"
+        max_occurrences: 2
+
+    forbidden:
+      - pattern: "No vas a creer"
+        reason: "Clickbait"
+      - pattern: "Hola amigos"
+        reason: "Weak hook"
+      - pattern: "Algunos expertos dicen"
+        reason: "Vague sourcing"
+      - pattern: "En conclusión"
+        reason: "AI-sounding"
+      - pattern: "Vamos a sumergirnos"
+        reason: "Overused"
+      - pattern: "Primero, Segundo, Tercero"
+        reason: "Robotic numbered lists"
+
+  vi:
+    allowed:
+      - pattern: "Nhưng đây mới là phần thú vị"
+        max_occurrences: 2
+      - pattern: "Hãy nhớ con số này"
+        max_occurrences: 3
+      - pattern: "Không ai nói về điều này"
+        max_occurrences: 2
+      - pattern: "Và rồi điều gì xảy ra"
+        max_occurrences: 2
+      - pattern: "Nhưng khoan đã"
+        max_occurrences: 2
+
+    forbidden:
+      - pattern: "Bạn sẽ không tin được"
+        reason: "Clickbait"
+      - pattern: "Xin chào các bạn"
+        reason: "Weak hook"
+      - pattern: "Một số chuyên gia nói"
+        reason: "Vague sourcing"
+      - pattern: "Tóm lại"
+        reason: "AI-sounding"
+      - pattern: "Hãy cùng đi sâu vào"
+        reason: "Overused"
+
+
+  en:
+    allowed:
+      - pattern: "But here is where it gets interesting"
+        max_occurrences: 2
+      - pattern: "Remember that number"
+        max_occurrences: 3
+      - pattern: "Nobody talks about this"
+        max_occurrences: 2
+      - pattern: "What happened next"
+        max_occurrences: 2
+      - pattern: "But wait"
+        max_occurrences: 2
+      - pattern: "Meanwhile"
+        max_occurrences: 3
+
+    forbidden:
+      - pattern: "You won't believe this"
+        reason: "Clickbait"
+      - pattern: "Hey guys"
+        reason: "Weak hook"
+      - pattern: "Some experts say"
+        reason: "Vague sourcing"
+      - pattern: "In conclusion"
+        reason: "AI-sounding"
+      - pattern: "Let's dive in"
+        reason: "Overused"
+      - pattern: "First, Second, Third"
+        reason: "Robotic numbered lists"
+
+# Script quality thresholds
+quality:
+  min_score: 75
+  max_improvement_iterations: 3
+  skip_improvement_if_score_above: 85
+  forbidden_penalty: -10
+  hook_overuse_penalty: -5

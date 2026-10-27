@@ -1,0 +1,10 @@
+{
+  "fps": 25,
+  "duration_sec": 5,
+  "title": "",
+  "chapters": [],
+  "words": [],
+  "scenes": [
+    { "id": "s000", "type": "quote", "start": 0, "end": 5, "data": { "text": "..." }, "beats": [] }
+  ]
+}

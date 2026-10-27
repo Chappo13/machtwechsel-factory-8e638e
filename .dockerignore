@@ -1,0 +1,19 @@
+# Build context hygiene — не слать на Railway лишнее (ускоряет билд)
+.git
+__pycache__
+*.pyc
+.pytest_cache
+node_modules
+frontend/node_modules
+remotion/node_modules
+# Большие/ненужные в образе данные
+data/output
+data/clip_cache
+data/music
+data/music_library
+*.zip
+*.tar.gz
+logs
+.env
+.venv
+venv

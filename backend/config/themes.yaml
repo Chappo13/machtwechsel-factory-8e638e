@@ -1,0 +1,198 @@
+# Content themes and stock video search tags per language
+
+themes:
+  de:
+    business_rise_fall:
+      weight: 0.50
+      description: "Aufstieg und Fall von Unternehmen"
+      base_tags:
+        - corporate office
+        - businessman
+        - stock market
+        - startup
+        - skyscraper
+        - factory
+        - headquarters
+      modifiers:
+        success:
+          - champagne celebration
+          - handshake deal
+          - growing chart
+          - luxury car
+          - money counting
+        failure:
+          - empty office
+          - closed sign
+          - stock crash
+          - bankruptcy
+          - abandoned building
+      example_topics:
+        - "Wie Wirecard ganz Deutschland betrogen hat"
+        - "Der Aufstieg und Fall von Nokia"
+        - "Warum Toys R Us wirklich gescheitert ist"
+        - "Das Geheimnis hinter dem Erfolg von ALDI"
+        - "Wie Boeing seinen Ruf zerstört hat"
+
+    geopolitics:
+      weight: 0.30
+      description: "Geopolitik und Wirtschaft"
+      base_tags:
+        - world map
+        - government building
+        - parliament
+        - flag
+        - city skyline
+      modifiers:
+        economy:
+          - factory production
+          - shipping container
+          - port crane
+          - oil rig
+        development:
+          - bridge construction
+          - high speed train
+          - solar panels
+          - modern city
+      example_topics:
+        - "Warum die Schweiz reicher ist als alle anderen"
+        - "Wie Singapur zur reichsten Stadt der Welt wurde"
+        - "Das Problem mit der deutschen Wirtschaft"
+
+    dark_psychology:
+      weight: 0.20
+      description: "Dunkle Psychologie und Manipulation"
+      base_tags:
+        - crowd people
+        - shopping mall
+        - social media phone
+        - billboard advertisement
+      modifiers:
+        manipulation:
+          - chess pieces
+          - shadow figure
+          - surveillance camera
+          - puppet strings
+        consumer:
+          - shopping cart
+          - credit card
+          - neon lights
+      example_topics:
+        - "Wie Supermärkte dich manipulieren"
+        - "Die dunkle Psychologie hinter Social Media"
+
+  es:
+    curiosity_history:
+      weight: 0.70
+      description: "Preguntas curiosas sobre la historia, la psicología y la naturaleza humana"
+      base_tags:
+        - ancient cave people fire
+        - prehistoric humans savanna
+        - starry night sky silhouette
+        - person thinking alone
+        - old artifact archaeology
+        - campfire group storytelling
+      modifiers:
+        ancient:
+          - cave painting wall
+          - stone tools primitive
+          - bone flute artifact
+          - seashell beads
+        modern:
+          - person scrolling phone
+          - city night lights
+          - office worker tired
+          - empty room window
+      example_topics:
+        - "¿Cómo Superaban el Aburrimiento los Pueblos Antiguos?"
+        - "Antes del Lenguaje, ¿Cómo se Declaraban su Amor los Humanos?"
+        - "¿Cómo Dormían los Antiguos Cuando No Existían los Relojes?"
+        - "¿Por Qué el Ser Humano es la Única Especie que se Aburre?"
+        - "Antes del Dinero, ¿Con Qué Comerciaban los Humanos?"
+
+    human_psychology:
+      weight: 0.30
+      description: "Psicología, comportamiento e instintos humanos desde la ciencia"
+      base_tags:
+        - human brain illustration
+        - crowd of people
+        - eye close up
+        - person alone reflection
+      example_topics:
+        - "¿Por Qué el Cerebro Humano Teme al Silencio?"
+        - "¿Qué Pasa en Tu Mente Cuando No Haces Absolutamente Nada?"
+
+    human_body_curiosity:
+      weight: 0.40
+      description: "Por qué el cuerpo y el comportamiento humano son así — curiosidad biológica/evolutiva (estilo Past Tense)"
+      base_tags:
+        - human body anatomy simple
+        - person eating food
+        - person sleeping in bed
+        - dna helix illustration
+        - prehistoric human hunting
+        - person scared afraid
+      example_topics:
+        - "¿Por Qué a los Humanos les Encanta el Queso?"
+        - "¿Por Qué los Humanos le Temen a las Arañas?"
+        - "¿Tenían Cáncer los Pueblos Antiguos?"
+        - "¿Por Qué Comemos Tres Veces al Día?"
+        - "¿Cómo Reaccionaban los Antiguos ante un Eclipse?"
+
+  vi:
+    curiosity_history:
+      weight: 0.70
+      description: "Câu hỏi tò mò về lịch sử, tâm lý và bản chất con người"
+      base_tags:
+        - ancient cave people fire
+        - prehistoric humans savanna
+        - starry night sky silhouette
+        - person thinking alone
+        - old artifact archaeology
+        - campfire group storytelling
+      modifiers:
+        ancient:
+          - cave painting wall
+          - stone tools primitive
+          - bone flute artifact
+          - seashell beads
+        modern:
+          - person scrolling phone
+          - city night lights
+          - office worker tired
+          - empty room window
+      example_topics:
+        - "Người Cổ Đại Đã Vượt Qua Sự Nhàm Chán Như Thế Nào?"
+        - "Trước Khi Có Ngôn Ngữ, Người Cổ Đại Tỏ Tình Như Thế Nào?"
+        - "Người Cổ Đại Đã Ngủ Như Thế Nào Khi Chưa Có Đồng Hồ?"
+        - "Vì Sao Con Người Là Loài Duy Nhất Biết Chán?"
+        - "Trước Khi Có Tiền, Con Người Trao Đổi Bằng Gì?"
+
+    human_psychology:
+      weight: 0.30
+      description: "Tâm lý con người, hành vi, bản năng qua góc nhìn khoa học"
+      base_tags:
+        - human brain illustration
+        - crowd of people
+        - eye close up
+        - person alone reflection
+      example_topics:
+        - "Vì Sao Bộ Não Con Người Sợ Sự Im Lặng?"
+        - "Điều Gì Xảy Ra Trong Đầu Khi Bạn Không Làm Gì Cả?"
+
+    human_body_curiosity:
+      weight: 0.40
+      description: "Vì sao cơ thể và hành vi con người lại như vậy — tò mò sinh học/tiến hóa (góc Past Tense)"
+      base_tags:
+        - human body anatomy simple
+        - person eating food
+        - person sleeping in bed
+        - dna helix illustration
+        - prehistoric human hunting
+        - person scared afraid
+      example_topics:
+        - "Vì Sao Con Người Yêu Phô Mai?"
+        - "Vì Sao Con Người Sợ Nhện?"
+        - "Người Cổ Đại Có Bị Ung Thư Không?"
+        - "Vì Sao Con Người Ăn Ba Bữa Một Ngày?"
+        - "Vì Sao Con Người Lại Béo Lên Qua Lịch Sử?"
+        - "Người Cổ Đại Phản Ứng Thế Nào Khi Có Nhật Thực?"

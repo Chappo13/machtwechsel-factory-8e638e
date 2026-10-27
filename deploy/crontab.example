@@ -1,0 +1,6 @@
+# Альтернатива systemd: добавь в crontab пользователя (`crontab -e`)
+# Запуск каждый день в 04:00:
+0 4 * * * cd ~/youtube-factory && .venv/bin/python3 autorun.py >> logs/autorun.log 2>&1
+
+# Discovery новых тем — раз в неделю, понедельник 03:00:
+0 3 * * 1 cd ~/youtube-factory && .venv/bin/python3 autorun.py --discover >> logs/autorun.log 2>&1

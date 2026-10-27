@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  # -------------------------------------------------------------------------
+  # Backend: FastAPI + FFmpeg + yt-dlp
+  # -------------------------------------------------------------------------
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime        # skip frontend-build stage locally
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: "8000"
+      PYTHONUNBUFFERED: "1"
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      VOICER_API_KEY: ${VOICER_API_KEY:-}
+      PEXELS_API_KEY: ${PEXELS_API_KEY:-}
+      PIXABAY_API_KEY: ${PIXABAY_API_KEY:-}
+      FREESOUND_API_KEY: ${FREESOUND_API_KEY:-}
+    volumes:
+      - ./backend:/app/backend:ro        # hot-reload source
+      - data:/app/data                   # persistent videos/clips/music
+      - ./logs:/app/logs
+    command: >
+      uvicorn backend.api.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --reload-dir /app/backend
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  # -------------------------------------------------------------------------
+  # Frontend: Vite dev server
+  # -------------------------------------------------------------------------
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm ci --prefer-offline && npm run dev -- --host 0.0.0.0"
+    environment:
+      VITE_API_URL: "http://localhost:8000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  data:
+    driver: local

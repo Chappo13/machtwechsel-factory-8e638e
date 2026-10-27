@@ -1,0 +1,19 @@
+# /etc/systemd/system/youtube-factory.service
+# One-shot unit для запуска одного видео из очереди
+# Активация через timer (см. .timer файл) или cron
+[Unit]
+Description=YouTube Factory — generate one video from queue
+After=network.target
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/youtube-factory
+EnvironmentFile=/home/ubuntu/youtube-factory/.env
+ExecStart=/home/ubuntu/youtube-factory/.venv/bin/python3 autorun.py
+StandardOutput=append:/home/ubuntu/youtube-factory/logs/autorun.log
+StandardError=append:/home/ubuntu/youtube-factory/logs/autorun.err
+TimeoutStartSec=3600
+
+[Install]
+WantedBy=multi-user.target
